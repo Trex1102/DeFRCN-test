@@ -89,6 +89,21 @@ def inference_on_dataset(model, data_loader, evaluator, cfg=None):
         logger.info("Start initializing PCB module, please wait a seconds...")
         pcb = PrototypicalCalibrationBlock(cfg)
 
+        pcb.visualize_prototypes_tsne(out_path="outputs/pcb_prototypes_tsne.png",
+                              perplexity=20,
+                              n_iter=1000,
+                              pca_components=50)
+        print('file created successfully ')
+
+        # visualize instance features + prototypes
+        pcb.visualize_featurebank_tsne(out_path="outputs/pcb_featurebank_tsne.png",
+                                    perplexity=50,
+                                    n_iter=1000,
+                                    pca_components=50,
+                                    max_points=2000)
+
+
+    exit(1)
     logger.info("Start inference on {} images".format(len(data_loader)))
     total = len(data_loader)  # inference data loader must have a fixed length
     evaluator.reset()

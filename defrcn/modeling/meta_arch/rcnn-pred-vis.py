@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -30,26 +29,6 @@ def xyxy_to_list(box: np.ndarray) -> List[float]:
     return [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
 
 
-def compute_iou(boxA: np.ndarray, boxB: np.ndarray) -> float:
-    # box format: [x1, y1, x2, y2]
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    interW = max(0.0, xB - xA)
-    interH = max(0.0, yB - yA)
-    interArea = interW * interH
-
-    areaA = max(0.0, boxA[2] - boxA[0]) * max(0.0, boxA[3] - boxA[1])
-    areaB = max(0.0, boxB[2] - boxB[0]) * max(0.0, boxB[3] - boxB[1])
-
-    union = areaA + areaB - interArea
-    if union <= 0:
-        return 0.0
-    return float(interArea / union)
-
-
 @META_ARCH_REGISTRY.register()
 class GeneralizedRCNN(nn.Module):
 
@@ -63,8 +42,8 @@ class GeneralizedRCNN(nn.Module):
         self.proposal_generator = build_proposal_generator(cfg, self._SHAPE_)
         self.roi_heads = build_roi_heads(cfg, self._SHAPE_)
         self.normalizer = self.normalize_fn()
-        self.affine_rpn = AffineLayer(num_channels=self._SHAPE_['res4'].channels, bias=True)
-        self.affine_rcnn = AffineLayer(num_channels=self._SHAPE_['res4'].channels, bias=True)
+        self.affine_rpn = AffineLayer(num_channels=self._SHAPE_["res4"].channels, bias=True)
+        self.affine_rcnn = AffineLayer(num_channels=self._SHAPE_["res4"].channels, bias=True)
         self.to(self.device)
 
         # where visualizations will be written (can override via cfg.DEFRCN.VIS_OUTPUT_DIR)
@@ -110,7 +89,7 @@ class GeneralizedRCNN(nn.Module):
             r = detector_postprocess(r, height, width)
             processed_results.append({"instances": r})
 
-            # save visualizations + jsons for this single sample
+            # save predictions image + json for this single sample
             try:
                 self._save_sample_visuals_and_json(
                     input, r, height, width, idx, image_size
@@ -155,16 +134,12 @@ class GeneralizedRCNN(nn.Module):
             self.cfg.MODEL.PIXEL_STD).to(self.device).view(num_channels, 1, 1))
         return lambda x: (x - pixel_mean) / pixel_std
 
-    # ------------------- visualization & json helpers -------------------
+    # ------------------- prediction-only visualization & json helpers -------------------
 
     def _save_sample_visuals_and_json(self, input_dict, pred_instances: Instances, height: int, width: int, idx: int, image_size):
         """
-        Save GT image, predictions image, matched predictions image and JSONs for a single sample.
-        - input_dict: one element from batched_inputs (may contain "instances", "file_name", "image", "image_id", ...)
-        - pred_instances: Instances returned by detector_postprocess for this image (already in target size coords)
-        - height, width: the target size used by detector_postprocess
-        - idx: index within the batch (used as fallback for naming)
-        - image_size: original image size tuple (unused here but kept for compatibility)
+        Save predictions image and JSON for a single sample.
+        Ground-truth related code has been removed so only predictions are saved.
         """
         try:
             # --- metadata & name base ---
@@ -249,31 +224,6 @@ class GeneralizedRCNN(nn.Module):
 
             H, W = height, width
 
-            # --- extract GT boxes & classes if present in input_dict["instances"] ---
-            gt_boxes_np = []
-            gt_classes_np = []
-            if "instances" in input_dict and input_dict["instances"] is not None:
-                try:
-                    gt_inst = input_dict["instances"].to("cpu")
-                    # Prefer standard attributes
-                    if hasattr(gt_inst, "gt_boxes"):
-                        gt_boxes_np = gt_inst.gt_boxes.tensor.numpy().astype(float).tolist()
-                    elif hasattr(gt_inst, "boxes"):
-                        gt_boxes_np = gt_inst.boxes.tensor.numpy().astype(float).tolist()
-                    # classes
-                    if hasattr(gt_inst, "gt_classes"):
-                        gt_classes_np = gt_inst.gt_classes.tensor.numpy().astype(int).tolist()
-                    elif hasattr(gt_inst, "gt_classes"):
-                        gt_classes_np = gt_inst.gt_classes.tensor.numpy().astype(int).tolist()
-                    elif hasattr(gt_inst, "labels"):
-                        try:
-                            gt_classes_np = gt_inst.labels.tensor.numpy().astype(int).tolist()
-                        except Exception:
-                            gt_classes_np = []
-                except Exception:
-                    gt_boxes_np = []
-                    gt_classes_np = []
-
             # --- extract predicted boxes/classes/scores from pred_instances (post-processed coords) ---
             pred_instances_cpu = pred_instances.to("cpu")
             pred_boxes_np = []
@@ -307,33 +257,9 @@ class GeneralizedRCNN(nn.Module):
                     clipped.append([x1, y1, x2, y2])
                 return clipped
 
-            gt_boxes_np = clip_box_list(gt_boxes_np) if len(gt_boxes_np) > 0 else []
             pred_boxes_np = clip_box_list(pred_boxes_np) if len(pred_boxes_np) > 0 else []
 
-            # --- compute matching (best IoU per prediction) ---
-            matches = []
-            for p_idx, p_box in enumerate(pred_boxes_np):
-                best_iou = 0.0
-                best_gt = -1
-                for g_idx, g_box in enumerate(gt_boxes_np):
-                    iou = compute_iou(np.array(p_box), np.array(g_box))
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_gt = g_idx
-                matches.append({"pred_idx": p_idx, "best_gt": best_gt, "best_iou": best_iou,
-                                "matched": bool(best_iou >= 0.5)})
-
-            # --- prepare JSON objects ---
-            gt_json = {
-                "id": base,
-                "height": H,
-                "width": W,
-                "ground_truths": [
-                    {"bbox": xyxy_to_list(np.array(box)), "class": class_name(c)}
-                    for box, c in zip(gt_boxes_np, gt_classes_np)
-                ],
-            }
-
+            # --- prepare predictions JSON object ---
             preds_json = {
                 "id": base,
                 "height": H,
@@ -343,26 +269,19 @@ class GeneralizedRCNN(nn.Module):
             for p_idx, box in enumerate(pred_boxes_np):
                 c = pred_classes_np[p_idx] if p_idx < len(pred_classes_np) else None
                 s = pred_scores_np[p_idx] if p_idx < len(pred_scores_np) else None
-                m = matches[p_idx]
                 preds_json["predictions"].append({
                     "bbox": xyxy_to_list(np.array(box)),
                     "class": class_name(c) if c is not None else None,
-                    "score": float(s) if s is not None else None,
-                    "matched_gt": int(m["best_gt"]) if m["best_gt"] >= 0 else None,
-                    "matched_iou": float(m["best_iou"]),
-                    "matched": bool(m["matched"])
+                    "score": float(s) if s is not None else None
                 })
 
-            # --- write json files ---
-            gt_json_path = os.path.join(self.vis_output_dir, f"{base}_gt.json")
+            # --- write predictions json file ---
             preds_json_path = os.path.join(self.vis_output_dir, f"{base}_preds.json")
             try:
-                with open(gt_json_path, "w") as f:
-                    json.dump(gt_json, f, indent=2)
                 with open(preds_json_path, "w") as f:
                     json.dump(preds_json, f, indent=2)
             except Exception:
-                logging.exception(f"Failed to write JSONs for base={base}")
+                logging.exception(f"Failed to write preds JSON for base={base}")
 
             # --- drawing utilities (robust to different detectron2 Visualizer API shapes) ---
             def build_instances_from_boxes(box_list, class_list=None, score_list=None):
@@ -400,19 +319,6 @@ class GeneralizedRCNN(nn.Module):
                 # fallback
                 return vis_img_np
 
-            # --- draw GT image ---
-            gt_image_path = os.path.join(self.vis_output_dir, f"{base}_gt.jpg")
-            try:
-                vgt = Visualizer(vis_img_np[:, :, ::-1], metadata=meta, scale=1.0, instance_mode=ColorMode.IMAGE)
-                gt_inst = build_instances_from_boxes(gt_boxes_np, gt_classes_np, None)
-                img_gt = extract_vis_image(vgt, gt_inst)
-                Image.fromarray(img_gt).save(gt_image_path)
-            except Exception:
-                try:
-                    Image.fromarray(vis_img_np).save(gt_image_path)
-                except Exception:
-                    logging.exception(f"Failed to save GT image for base={base}")
-
             # --- draw ALL predictions image ---
             preds_image_path = os.path.join(self.vis_output_dir, f"{base}_preds.jpg")
             try:
@@ -426,25 +332,7 @@ class GeneralizedRCNN(nn.Module):
                 except Exception:
                     logging.exception(f"Failed to save preds image for base={base}")
 
-            # --- draw only matched predictions ---
-            matched_image_path = os.path.join(self.vis_output_dir, f"{base}_matched_preds.jpg")
-            try:
-                matched_boxes = [pred_boxes_np[m["pred_idx"]] for m in matches if m["matched"]]
-                matched_classes = [pred_classes_np[m["pred_idx"]] for m in matches if m["matched"]]
-                matched_scores = [pred_scores_np[m["pred_idx"]] for m in matches if m["matched"]]
-                vm = Visualizer(vis_img_np[:, :, ::-1], metadata=meta, scale=1.0, instance_mode=ColorMode.IMAGE)
-                m_inst = build_instances_from_boxes(matched_boxes, matched_classes, matched_scores)
-                img_match = extract_vis_image(vm, m_inst)
-                Image.fromarray(img_match).save(matched_image_path)
-            except Exception:
-                try:
-                    Image.fromarray(vis_img_np).save(matched_image_path)
-                except Exception:
-                    logging.exception(f"Failed to save matched preds image for base={base}")
-
             # done
         except Exception:
             # do not crash main inference for visualization failure
             logging.exception(f"Unhandled error saving visuals for sample idx={idx}")
-
-
