@@ -89,6 +89,8 @@ def inference_on_dataset(model, data_loader, evaluator, cfg=None):
         logger.info("Start initializing PCB module, please wait a seconds...")
         pcb = PrototypicalCalibrationBlock(cfg)
 
+
+
         pcb.visualize_prototypes_tsne(out_path="outputs/pcb_prototypes_tsne.png",
                               perplexity=20,
                               n_iter=1000,
@@ -100,7 +102,8 @@ def inference_on_dataset(model, data_loader, evaluator, cfg=None):
                                     perplexity=50,
                                     n_iter=1000,
                                     pca_components=50,
-                                    max_points=2000)
+                                    max_points=2000)                           
+        similarities = pcb.compute_pairwise_prototype_similarity()
 
 
     exit(1)

@@ -152,6 +152,8 @@
 
 
 # modified_prototypical_calibration_block.py
+
+
 import os
 import cv2
 import json
@@ -160,6 +162,7 @@ import logging
 import detectron2
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd  # Add this to your imports at the top
 
 from detectron2.structures import ImageList
 from detectron2.modeling.poolers import ROIPooler
@@ -168,6 +171,7 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from defrcn.dataloader import build_detection_test_loader
 from defrcn.evaluation.archs import resnet101
+from tabulate import tabulate  # Optional: for nicely formatted logging table
 
 logger = logging.getLogger(__name__)
 
@@ -502,3 +506,64 @@ class PrototypicalCalibrationBlock:
         plt.close()
         logger.info("Saved featurebank t-SNE/PCA to {}".format(out_path))
         return out_path
+    
+    
+    def compute_pairwise_prototype_similarity(self, print_table=True, save_csv_path="prototype_similarity.csv", threshold=0.6):
+        """
+        Compute pairwise cosine similarity between all class prototypes and
+        save only the class pairs whose similarity is greater than `threshold`.
+
+        Args:
+            print_table (bool): whether to pretty-print the filtered pairs.
+            save_csv_path (str): path to save the filtered pairs CSV.
+            threshold (float): similarity cutoff in [0,1] (default 0.5 => 50%).
+
+        Returns:
+            A dict of the form {(cls1, cls2): similarity, ...} for pairs with similarity > threshold.
+        """
+        if not self.prototypes:
+            raise RuntimeError("Prototypes not built. Call build_prototypes() first.")
+
+        # Get sorted class IDs
+        class_ids = sorted(self.prototypes.keys())
+        # Stack all prototype vectors into a matrix [num_classes, D]
+        prot_matrix = torch.cat([self.prototypes[c] for c in class_ids], dim=0).cpu().numpy()
+
+        # Compute cosine similarity matrix [num_classes x num_classes]
+        similarity_matrix = cosine_similarity(prot_matrix)
+
+        # Collect only pairs with similarity > threshold (exclude self-pairs and duplicates)
+        filtered_pairs = []
+        filtered_dict = {}
+        n = len(class_ids)
+        for i in range(n):
+            for j in range(i + 1, n):  # j > i ensures each unordered pair only once
+                sim = float(similarity_matrix[i, j])
+                if sim > threshold:
+                    cls1, cls2 = class_ids[i], class_ids[j]
+                    filtered_pairs.append({"class1": cls1, "class2": cls2, "similarity": sim})
+                    filtered_dict[(cls1, cls2)] = sim
+
+        # Save filtered pairs to CSV (class1, class2, similarity)
+        os.makedirs(os.path.dirname(save_csv_path) or ".", exist_ok=True)
+        if filtered_pairs:
+            df_pairs = pd.DataFrame(filtered_pairs)
+            df_pairs.to_csv(save_csv_path, index=False)
+            logger.info(f"Saved filtered prototype pairs (similarity > {threshold:.2f}) to {save_csv_path}")
+        else:
+            # create empty CSV with headers for clarity
+            df_pairs = pd.DataFrame(columns=["class1", "class2", "similarity"])
+            df_pairs.to_csv(save_csv_path, index=False)
+            logger.info(f"No prototype pairs found with similarity > {threshold:.2f}. Created empty file at {save_csv_path}")
+
+        # Optional: Pretty-print the filtered pairs
+        if print_table:
+            if filtered_pairs:
+                rows = [[p["class1"], p["class2"], "{:.2f}".format(p["similarity"])] for p in filtered_pairs]
+                headers = ["class1", "class2", "similarity"]
+                table = tabulate(rows, headers=headers, tablefmt="fancy_grid")
+                logger.info("Filtered Prototype Pairs (similarity > {:.2f}):\n{}".format(threshold, table))
+            else:
+                logger.info("No prototype pairs exceed the similarity threshold of {:.2f}.".format(threshold))
+
+        return filtered_dict
