@@ -15,6 +15,7 @@ from detectron2.modeling.backbone.resnet import BottleneckBlock, make_stage
 from detectron2.modeling.proposal_generator.proposal_utils import add_ground_truth_to_proposals
 from .box_head import build_box_head
 from .fast_rcnn import ROI_HEADS_OUTPUT_REGISTRY, FastRCNNOutputLayers, FastRCNNOutputs
+from contrastive.multihead_contrastive import MultiHeadContrastive
 
 ROI_HEADS_REGISTRY = Registry("ROI_HEADS")
 ROI_HEADS_REGISTRY.__doc__ = """
@@ -514,3 +515,196 @@ class StandardROIHeads(ROIHeads):
                 self.test_detections_per_img,
             )
             return pred_instances
+
+
+@ROI_HEADS_REGISTRY.register()
+class MultiHeadContrastive(Res5ROIHeads):
+    """
+    Subclass of Res5ROIHeads that adds a multi-head contrastive loss.
+    Assumes label_and_sample_proposals() already sets gt_classes and gt_boxes for
+    every sampled proposal (fast path).
+    """
+
+    def __init__(self, cfg, input_shape):
+        # initialize parent (builds pooler, res5, box_predictor, etc.)
+        super().__init__(cfg, input_shape)
+
+        # Read contrastive config from cfg.MODEL.CONTRASTIVE (if present)
+        c_cfg = getattr(cfg.MODEL, "CONTRASTIVE", None)
+        if c_cfg is not None:
+            proj_hidden = getattr(c_cfg, "PROJ_HIDDEN", 256)
+            fg_bg_dim = getattr(c_cfg, "FG_BG_DIM", 64)
+            class_dim = getattr(c_cfg, "CLASS_DIM", 128)
+            tau = getattr(c_cfg, "TAU", 0.2)
+            iou_threshold = getattr(c_cfg, "IOU_THRESHOLD", 0.5)
+            use_iou_reweight = getattr(c_cfg, "USE_IOU_REWEIGHT", True)
+            bg_as_neg_only = getattr(c_cfg, "BG_AS_NEG_ONLY", True)
+            loss_weights = (
+                getattr(c_cfg, "FG_BG_WEIGHT", 1.0),
+                getattr(c_cfg, "CLASS_WEIGHT", 1.0),
+            )
+            feat_dim_cfg = getattr(c_cfg, "FEAT_DIM", None)
+        else:
+            proj_hidden = 256
+            fg_bg_dim = 64
+            class_dim = 128
+            tau = 0.2
+            iou_threshold = 0.5
+            use_iou_reweight = True
+            bg_as_neg_only = True
+            loss_weights = (1.0, 1.0)
+            feat_dim_cfg = None
+
+        # Infer feature dim:
+        # Priority: cfg.MODEL.CONTRASTIVE.FEAT_DIM -> try to infer from res5 -> fallback to 2048
+        if feat_dim_cfg is not None:
+            feat_dim = int(feat_dim_cfg)
+        else:
+            feat_dim = None
+            try:
+                # try to inspect res5 last block if possible (works for standard bottleneck)
+                last = None
+                for m in self.res5.modules():
+                    last = m
+                if last is not None and hasattr(last, "conv3") and hasattr(last.conv3, "out_channels"):
+                    feat_dim = last.conv3.out_channels
+            except Exception:
+                feat_dim = None
+
+            if feat_dim is None:
+                # try box_predictor hidden dim if available
+                if hasattr(self.box_predictor, "hidden_dim"):
+                    feat_dim = getattr(self.box_predictor, "hidden_dim")
+                else:
+                    # conservative fallback
+                    feat_dim = 2048
+
+        # create contrastive module
+        self.multihead_cl = MultiHeadContrastive(
+            feat_dim=feat_dim,
+            proj_hidden=proj_hidden,
+            fg_bg_dim=fg_bg_dim,
+            class_dim=class_dim,
+            tau=tau,
+            iou_threshold=iou_threshold,
+            use_iou_reweight=use_iou_reweight,
+            bg_as_negatives_only=bg_as_neg_only,
+            loss_weights=loss_weights,
+        )
+
+    def _concat_gt_classes_quick(self, proposals, device):
+        """
+        Fast path (you said it's guaranteed): concatenate gt_classes for all proposals.
+        Detectron2 sampled labels convention: classes in [0, C-1]; background labeled as C.
+        We'll map to contrastive module convention:
+            -1 -> -1 (ignore)
+             C -> 0  (background)
+           0..C-1 -> 1..C  (foreground classes shifted by +1)
+        """
+        # Concatenate raw
+        raw_labels = torch.cat([p.gt_classes.to(device) for p in proposals], dim=0)
+
+        # Map labels to contrastive format
+        bg_val = self.num_classes  # Detectron2 uses num_classes as bg label in sampled proposals
+        labels = torch.full_like(raw_labels, fill_value=-1)  # init -1
+        is_bg = raw_labels == bg_val
+        is_fg = (raw_labels >= 0) & (raw_labels < bg_val)
+        labels[is_bg] = 0
+        labels[is_fg] = raw_labels[is_fg] + 1  # shift classes to 1..C
+        return labels  # shape [sum(M_i, over images)]
+
+    def _concat_matched_ious_quick(self, proposals, device):
+        """
+        Fast path: compute per-proposal IoU between proposal_boxes and matched gt_boxes.
+        Assumes proposals[i].proposal_boxes and proposals[i].gt_boxes have same length and ordering.
+        """
+        iou_list = []
+        eps = 1e-6
+        for p in proposals:
+            prop = p.proposal_boxes.tensor  # [M,4]
+            gt = p.gt_boxes.tensor          # [M,4]
+            # compute pairwise per-row IoU (assumes aligned)
+            x1 = torch.max(prop[:, 0], gt[:, 0])
+            y1 = torch.max(prop[:, 1], gt[:, 1])
+            x2 = torch.min(prop[:, 2], gt[:, 2])
+            y2 = torch.min(prop[:, 3], gt[:, 3])
+            inter_w = (x2 - x1).clamp(min=0)
+            inter_h = (y2 - y1).clamp(min=0)
+            inter = inter_w * inter_h
+            area_prop = ((prop[:, 2] - prop[:, 0]).clamp(min=0) *
+                         (prop[:, 3] - prop[:, 1]).clamp(min=0))
+            area_gt = ((gt[:, 2] - gt[:, 0]).clamp(min=0) *
+                       (gt[:, 3] - gt[:, 1]).clamp(min=0))
+            union = area_prop + area_gt - inter + eps
+            ious = inter / union
+            iou_list.append(ious.to(device))
+        if len(iou_list) == 0:
+            return torch.tensor([], dtype=torch.float32, device=device)
+        return torch.cat(iou_list, dim=0)
+
+    def forward(self, images, features, proposals, targets=None):
+        """
+        Override forward to inject contrastive losses using the fast path (direct concat).
+        This reuses the Res5ROIHeads pooling/res5/box_predictor flow.
+        """
+        del images
+
+        if self.training:
+            # samples proposals and sets gt_classes / gt_boxes in-place (assumed)
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        del targets
+
+        # 1) ROI pooling + res5
+        proposal_boxes = [x.proposal_boxes for x in proposals]
+        box_features = self._shared_roi_transform(
+            [features[f] for f in self.in_features], proposal_boxes
+        )
+        feature_pooled = box_features.mean(dim=[2, 3])  # [N_total, feat_dim]
+
+        # 2) standard predictor
+        pred_class_logits, pred_proposal_deltas = self.box_predictor(feature_pooled)
+
+        # 3) FastRCNNOutputs
+        outputs = FastRCNNOutputs(
+            self.box2box_transform,
+            pred_class_logits,
+            pred_proposal_deltas,
+            proposals,
+            self.smooth_l1_beta,
+        )
+
+        if self.training:
+            # standard detection losses
+            del features
+            losses = outputs.losses()
+
+            # --- FAST PATH: concat gt_classes and matched gt_boxes IoUs ---
+            # We assume label_and_sample_proposals populated gt_classes & gt_boxes
+            device = feature_pooled.device
+
+            # gather labels and convert to contrastive label scheme
+            labels = self._concat_gt_classes_quick(proposals, device)  # -1,0,1..C
+            # gather IoUs
+            ious = self._concat_matched_ious_quick(proposals, device)  # floats in [0,1]
+
+            # defensive alignment: pool/features length should equal labels length,
+            # but if not, cut to min (only in case of unexpected mismatch)
+            m = min(feature_pooled.shape[0], labels.shape[0])
+            if m != feature_pooled.shape[0] or m != labels.shape[0]:
+                feature_pooled = feature_pooled[:m]
+                labels = labels[:m]
+                ious = ious[:m] if ious.numel() > 0 else torch.zeros(m, device=device)
+
+            # compute contrastive losses
+            contrastive_losses = self.multihead_cl(feature_pooled, labels, ious)
+            # merge
+            losses.update(contrastive_losses)
+
+            return [], losses
+        else:
+            pred_instances, _ = outputs.inference(
+                self.test_score_thresh,
+                self.test_nms_thresh,
+                self.test_detections_per_img,
+            )
+            return pred_instances, {}

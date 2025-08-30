@@ -2,8 +2,8 @@
 
 EXP_NAME=1
 SAVE_DIR=checkpoints/voc/${EXP_NAME}
-IMAGENET_PRETRAIN=pretrained_weights/R-101.pkl                            # <-- change it to you path
-IMAGENET_PRETRAIN_TORCH=pretrained_weights/resnet101-5d3b4d8f.pth  # <-- change it to you path
+IMAGENET_PRETRAIN=pretrained_weights/R-101.pkl                            
+IMAGENET_PRETRAIN_TORCH=pretrained_weights/resnet101-5d3b4d8f.pth  
 SPLIT_ID=1
 
 
