@@ -5,7 +5,7 @@ MODEL:
     PRE_NMS_TOPK_TEST: 6000
     POST_NMS_TOPK_TEST: 1000
   ROI_HEADS:
-    NAME: "Res5ROIHeads"
+    NAME: "MultiHeadContrastiveHead"
 DATASETS:
   TRAIN: ("coco_2017_train",)
   TEST: ("coco_2017_val",)

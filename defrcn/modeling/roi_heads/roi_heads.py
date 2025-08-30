@@ -15,7 +15,7 @@ from detectron2.modeling.backbone.resnet import BottleneckBlock, make_stage
 from detectron2.modeling.proposal_generator.proposal_utils import add_ground_truth_to_proposals
 from .box_head import build_box_head
 from .fast_rcnn import ROI_HEADS_OUTPUT_REGISTRY, FastRCNNOutputLayers, FastRCNNOutputs
-from contrastive.multihead_contrastive import MultiHeadContrastive
+from .multihead_contrastive import MultiHeadContrastive
 
 ROI_HEADS_REGISTRY = Registry("ROI_HEADS")
 ROI_HEADS_REGISTRY.__doc__ = """
