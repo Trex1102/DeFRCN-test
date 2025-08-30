@@ -104,9 +104,6 @@ def inference_on_dataset(model, data_loader, evaluator, cfg=None):
                                     pca_components=50,
                                     max_points=2000)                           
         similarities = pcb.compute_pairwise_prototype_similarity()
-
-
-    exit(1)
     logger.info("Start inference on {} images".format(len(data_loader)))
     total = len(data_loader)  # inference data loader must have a fixed length
     evaluator.reset()
