@@ -519,11 +519,6 @@ class StandardROIHeads(ROIHeads):
 
 @ROI_HEADS_REGISTRY.register()
 class MultiHeadContrastiveHead(Res5ROIHeads):
-    """
-    Subclass of Res5ROIHeads that adds a multi-head contrastive loss.
-    Assumes label_and_sample_proposals() already sets gt_classes and gt_boxes for
-    every sampled proposal (fast path).
-    """
 
     def __init__(self, cfg, input_shape):
         # initialize parent (builds pooler, res5, box_predictor, etc.)
