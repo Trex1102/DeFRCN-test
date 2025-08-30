@@ -531,12 +531,12 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             fg_bg_dim = getattr(c_cfg, "FG_BG_DIM", 64)
             class_dim = getattr(c_cfg, "CLASS_DIM", 128)
             tau = getattr(c_cfg, "TAU", 0.2)
-            iou_threshold = getattr(c_cfg, "IOU_THRESHOLD", 0.5)
+            iou_threshold = getattr(c_cfg, "IOU_THRESHOLD", 0.7)
             use_iou_reweight = getattr(c_cfg, "USE_IOU_REWEIGHT", True)
             bg_as_neg_only = getattr(c_cfg, "BG_AS_NEG_ONLY", True)
             loss_weights = (
-                getattr(c_cfg, "FG_BG_WEIGHT", 1.0),
-                getattr(c_cfg, "CLASS_WEIGHT", 1.0),
+                getattr(c_cfg, "FG_BG_WEIGHT", 0.5),
+                getattr(c_cfg, "CLASS_WEIGHT", 0.5),
             )
             feat_dim_cfg = getattr(c_cfg, "FEAT_DIM", None)
         else:
@@ -544,10 +544,10 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             fg_bg_dim = 64
             class_dim = 128
             tau = 0.2
-            iou_threshold = 0.5
+            iou_threshold = 0.7
             use_iou_reweight = True
             bg_as_neg_only = True
-            loss_weights = (1.0, 1.0)
+            loss_weights = (0.5, 0.5)
             feat_dim_cfg = None
 
         # Infer feature dim:
