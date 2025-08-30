@@ -49,7 +49,7 @@ done
 # python3 tools/model_surgery.py --dataset voc --method randinit                                \
 #     --src-path ${SAVE_DIR}/defrcn_det_r101_base${SPLIT_ID}/model_final.pth                    \
 #     --save-dir ${SAVE_DIR}/defrcn_det_r101_base${SPLIT_ID}
-BASE_WEIGHT=${SAVE_DIR}/defrcn_det_r101_base${SPLIT_ID}/model_reset_surgery.pth
+# BASE_WEIGHT=${SAVE_DIR}/defrcn_det_r101_base${SPLIT_ID}/model_reset_surgery.pth
 
 
 # ------------------------------ Novel Fine-tuning ------------------------------- #
