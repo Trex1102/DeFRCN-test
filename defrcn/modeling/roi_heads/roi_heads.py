@@ -518,7 +518,7 @@ class StandardROIHeads(ROIHeads):
 
 
 @ROI_HEADS_REGISTRY.register()
-class MultiHeadContrastive(Res5ROIHeads):
+class MultiHeadContrastiveHead(Res5ROIHeads):
     """
     Subclass of Res5ROIHeads that adds a multi-head contrastive loss.
     Assumes label_and_sample_proposals() already sets gt_classes and gt_boxes for
