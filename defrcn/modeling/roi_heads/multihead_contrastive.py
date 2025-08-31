@@ -178,6 +178,11 @@ class MultiHeadContrastive(nn.Module):
 
         per_anchor_losses = []
         per_anchor_weights = []
+
+        # ======= CHANGES START =======
+        gamma = 2.0                                  # <-- ADDED: focal gamma (configurable if desired)
+        # ======= CHANGES END =======
+
         for i in torch.nonzero(anchor_mask, as_tuple=False).view(-1):
             i = int(i.item())
             positives = pos_mask[i].clone()
@@ -187,9 +192,21 @@ class MultiHeadContrastive(nn.Module):
                 continue
             numer = (torch.exp(sim[i]) * positives.float()).sum()
             den = denom[i] + EPS
-            loss_i = -torch.log((numer + EPS) / (den + EPS))
+
+            # loss_i = -torch.log((numer + EPS) / (den + EPS))
+
+            # ======= CHANGES START =======
+            # OLD (removed) line:
+            # loss_i = -torch.log((numer + EPS) / (den + EPS))
+            # REPLACED BY focal-style probability + loss:
+            p = (numer + EPS) / (den + EPS)             # <-- ADDED: probability of sampling a positive
+            p = torch.clamp(p, min=EPS, max=1.0 - EPS)  # <-- ADDED: numerical safety clamp
+            loss_i = -((1.0 - p) ** gamma) * torch.log(p + EPS)  # <-- CHANGED: focal-style loss
+            # ======= CHANGES END =======
+
             # weight by IoU (if enabled). For background-as-negatives-only we only computed anchors for fg, so iou corresponds to gt IoU.
             w = iou_weight[i] if self.use_iou_reweight else 1.0
+
             per_anchor_losses.append(loss_i * w)
             per_anchor_weights.append(w)
 
