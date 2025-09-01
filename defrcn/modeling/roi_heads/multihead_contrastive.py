@@ -223,69 +223,143 @@ class MultiHeadContrastive(nn.Module):
 
 
 
-    def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor, fg_mask: torch.Tensor,
-                                  ignore_mask: torch.Tensor, iou_weight: torch.Tensor):
-        """
-        Implements:
-        L = (1 / sum_w) * sum_i w_i * L_{z_i}
-        where
-        L_{z_i} = - (1 / n_pos) * sum_{j in P(i)} log( exp(sim_ij) / sum_{k != i, not ignored} exp(sim_ik) )
-        and P(i) are positives (same class, label != 0, not ignored).
-        """
+    # def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor, fg_mask: torch.Tensor,
+    #                               ignore_mask: torch.Tensor, iou_weight: torch.Tensor):
+    #     """
+    #     Implements:
+    #     L = (1 / sum_w) * sum_i w_i * L_{z_i}
+    #     where
+    #     L_{z_i} = - (1 / n_pos) * sum_{j in P(i)} log( exp(sim_ij) / sum_{k != i, not ignored} exp(sim_ik) )
+    #     and P(i) are positives (same class, label != 0, not ignored).
+    #     """
+    #     device = z_cls.device
+    #     N = z_cls.shape[0]
+    #     EPS = 1e-8
+
+    #     anchor_mask = fg_mask.clone() & (~ignore_mask)           # which anchors to compute loss for
+
+    #     # pairwise same-label positives (exclude ignored proposals)
+    #     labels_expand = labels.unsqueeze(0).expand(N, N)         # [N, N]
+    #     pos_mask = (labels_expand == labels_expand.T) & (~ignore_mask.unsqueeze(0).expand(N, N))
+    #     pos_mask = pos_mask & (labels_expand != 0)              # remove label 0 as positive
+
+    #     # pairwise similarity
+    #     sim = torch.matmul(z_cls, z_cls.T) / self.tau            # [N, N]
+    #     diag = torch.eye(N, dtype=torch.bool, device=device)
+
+    #     # build valid mask for denominator: exclude self and ignored items
+    #     valid_for_den = (~diag) & (~ignore_mask.unsqueeze(0).expand(N, N))
+
+    #     # compute exponentials only where valid (to exclude ignored in denom)
+    #     sim_exp = torch.exp(sim) * valid_for_den.float()        # [N, N]
+    #     denom = sim_exp.sum(dim=1) + EPS                        # [N]
+
+    #     per_anchor_losses = []
+    #     per_anchor_weights = []
+    #     for i_idx in torch.nonzero(anchor_mask, as_tuple=False).view(-1):
+    #         i = int(i_idx.item())
+    #         positives = pos_mask[i].clone()
+    #         positives[i] = False
+    #         n_pos = int(positives.sum().item())
+    #         if n_pos == 0:
+    #             continue
+
+    #         # numerator exponentials for positives (only those not ignored and same class)
+    #         numer_exp = (torch.exp(sim[i]) * positives.float())   # [N]
+
+    #         # probabilities for each positive: exp(sim_ij) / denom_i
+    #         probs = numer_exp / (denom[i] + EPS)                 # [N]
+
+    #         # per-anchor loss = average negative log probability over positives
+    #         # add EPS for numerical safety inside log
+    #         loss_i = - (torch.log(probs + EPS).sum()) / float(n_pos)
+
+    #         # IoU reweight if requested (f(u_i))
+    #         w = iou_weight[i] if getattr(self, "use_iou_reweight", False) else 1.0
+
+    #         per_anchor_losses.append(loss_i * w)
+    #         per_anchor_weights.append(w)
+
+    #     if len(per_anchor_losses) == 0:
+    #         return torch.tensor(0., device=device, requires_grad=True)
+
+    #     per_anchor_losses = torch.stack(per_anchor_losses)               # [M]
+    #     per_anchor_weights = torch.tensor(per_anchor_weights, device=device)  # [M]
+
+    #     # weighted average over anchors (matches 1/N sum f(u_i) * L_z_i up to normalization by sum_w)
+    #     loss = per_anchor_losses.sum() / (per_anchor_weights.sum() + EPS)
+    #     return loss
+
+
+    def _class_supervised_contrastive_stable(self, z_cls: torch.Tensor, labels: torch.Tensor,
+                                         fg_mask: torch.Tensor, ignore_mask: torch.Tensor,
+                                         iou_weight: torch.Tensor):
         device = z_cls.device
         N = z_cls.shape[0]
-        EPS = 1e-8
+        EPS = 1e-12
 
-        anchor_mask = fg_mask.clone() & (~ignore_mask)           # which anchors to compute loss for
+        anchor_mask = fg_mask.clone() & (~ignore_mask)  # anchors to compute loss for
 
         # pairwise same-label positives (exclude ignored proposals)
         labels_expand = labels.unsqueeze(0).expand(N, N)         # [N, N]
         pos_mask = (labels_expand == labels_expand.T) & (~ignore_mask.unsqueeze(0).expand(N, N))
         pos_mask = pos_mask & (labels_expand != 0)              # remove label 0 as positive
 
-        # pairwise similarity
-        sim = torch.matmul(z_cls, z_cls.T) / self.tau            # [N, N]
+        # pairwise similarity logits
+        sim = torch.matmul(z_cls, z_cls.T) / self.tau           # [N, N]
         diag = torch.eye(N, dtype=torch.bool, device=device)
 
-        # build valid mask for denominator: exclude self and ignored items
+        # valid entries in denominator: exclude self and ignored items
         valid_for_den = (~diag) & (~ignore_mask.unsqueeze(0).expand(N, N))
-
-        # compute exponentials only where valid (to exclude ignored in denom)
-        sim_exp = torch.exp(sim) * valid_for_den.float()        # [N, N]
-        denom = sim_exp.sum(dim=1) + EPS                        # [N]
 
         per_anchor_losses = []
         per_anchor_weights = []
+
         for i_idx in torch.nonzero(anchor_mask, as_tuple=False).view(-1):
             i = int(i_idx.item())
+
+            # mask for valid logits (exclude self and ignored)
+            valid_mask = valid_for_den[i]  # bool mask [N]
+            if not valid_mask.any():
+                continue
+
+            # positives for this anchor (exclude self)
             positives = pos_mask[i].clone()
             positives[i] = False
+            positives = positives & valid_mask  # ensure positives are valid (not ignored)
             n_pos = int(positives.sum().item())
             if n_pos == 0:
                 continue
 
-            # numerator exponentials for positives (only those not ignored and same class)
-            numer_exp = (torch.exp(sim[i]) * positives.float())   # [N]
+            # Extract logits for valid entries
+            logits_valid = sim[i][valid_mask]   # shape [K]
+            # compute log-sum-exp for denom in a stable way
+            denom_log = torch.logsumexp(logits_valid, dim=0)  # scalar
 
-            # probabilities for each positive: exp(sim_ij) / denom_i
-            probs = numer_exp / (denom[i] + EPS)                 # [N]
+            # we need the logits of positives (they are a subset of valid_mask)
+            # map the positive indices into the valid_logits positions:
+            # find indices of valid positions
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).view(-1)  # global indices
+            # create boolean selection among valid entries
+            pos_in_valid = torch.isin(valid_indices, torch.nonzero(positives, as_tuple=False).view(-1))
 
-            # per-anchor loss = average negative log probability over positives
-            # add EPS for numerical safety inside log
-            loss_i = - (torch.log(probs + EPS).sum()) / float(n_pos)
+            logits_pos = logits_valid[pos_in_valid]  # [n_pos]
 
-            # IoU reweight if requested (f(u_i))
+            # sum of log-probs over positives: sum_j (logits_pos_j - denom_log)
+            sum_log_probs = (logits_pos - denom_log).sum()
+
+            # per-anchor loss = - (1/n_pos) * sum_log_probs
+            loss_i = - sum_log_probs / float(n_pos)
+
             w = iou_weight[i] if getattr(self, "use_iou_reweight", False) else 1.0
-
             per_anchor_losses.append(loss_i * w)
             per_anchor_weights.append(w)
 
         if len(per_anchor_losses) == 0:
             return torch.tensor(0., device=device, requires_grad=True)
 
-        per_anchor_losses = torch.stack(per_anchor_losses)               # [M]
-        per_anchor_weights = torch.tensor(per_anchor_weights, device=device)  # [M]
+        per_anchor_losses = torch.stack(per_anchor_losses)
+        per_anchor_weights = torch.tensor(per_anchor_weights, device=device, device=device)
 
-        # weighted average over anchors (matches 1/N sum f(u_i) * L_z_i up to normalization by sum_w)
         loss = per_anchor_losses.sum() / (per_anchor_weights.sum() + EPS)
         return loss
