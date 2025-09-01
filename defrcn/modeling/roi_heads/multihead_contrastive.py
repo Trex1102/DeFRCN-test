@@ -99,47 +99,6 @@ class MultiHeadContrastive(nn.Module):
             "loss_supcon": loss_supcon * self.class_weight
         }
 
-    def _compute_supcon_loss(self, z_norm: torch.Tensor, anchor_mask: torch.Tensor, pos_mask: torch.Tensor):
-        """
-        Generic supervised contrastive mechanics.
-        - z_norm: [N, D] normalized embeddings
-        - anchor_mask: [N] bool mask indicating which anchors to compute loss for
-        - pos_mask: [N, N] bool, pos_mask[i,j] True if j is positive for anchor i (excluding self)
-        Returns scalar loss (averaged over valid anchors)
-        """
-        device = z_norm.device
-        N = z_norm.shape[0]
-        sim = torch.matmul(z_norm, z_norm.T)  # cosine since normalized
-        sim = sim / self.tau
-
-        # mask self
-        diag = torch.eye(N, dtype=torch.bool, device=device)
-        sim_exp = torch.exp(sim) * (~diag).float()  # zero out self-sim before exp was applied but keep matrix shape
-        # denominator for each anchor: sum over k != i of exp(sim_ik)
-        denom = sim_exp.sum(dim=1)  # [N]
-
-        losses = []
-        valid_anchor_count = 0
-        for i in torch.nonzero(anchor_mask, as_tuple=False).view(-1):
-            i = int(i.item())
-            positives = pos_mask[i]  # boolean tensor length N
-            positives[i] = False  # ensure exclude self
-            n_pos = positives.sum().item()
-            if n_pos == 0:
-                # no positives for this anchor -> skip
-                continue
-            # numerator: sum over positive j of exp(sim_ij)
-            numer = (torch.exp(sim[i]) * positives.float()).sum()
-            # denom: sum over all k != i
-            den = denom[i] + EPS
-            loss_i = - torch.log((numer + EPS) / (den + EPS))
-            losses.append(loss_i)
-            valid_anchor_count += 1
-
-        if valid_anchor_count == 0:
-            return torch.tensor(0., device=device, requires_grad=True)
-        return torch.stack(losses).mean()
-
     def _fg_bg_contrastive(self, z_fg: torch.Tensor, fg_mask: torch.Tensor, bg_mask: torch.Tensor,
                            ignore_mask: torch.Tensor, iou_weight: torch.Tensor):
         """
@@ -224,18 +183,19 @@ class MultiHeadContrastive(nn.Module):
         """
         device = z_cls.device
         N = z_cls.shape[0]
-        # anchor candidates: only fg (exclude bg and ignore)
+
         anchor_mask = fg_mask.clone() & (~ignore_mask)
 
-        # pos_mask[i,j] = True if labels[i] == labels[j] AND both not ignored
         labels_expand = labels.unsqueeze(0).expand(N, N)
         pos_mask = (labels_expand == labels_expand.T) & (~ignore_mask.unsqueeze(0).expand(N, N))
-        # exclude background from positives (bg label==0)
+        
+
         pos_mask = pos_mask & (labels_expand != 0)
 
         # compute per-anchor numerator/denom like supcon
         sim = torch.matmul(z_cls, z_cls.T) / self.tau
         diag = torch.eye(N, dtype=torch.bool, device=device)
+        
         sim_exp = torch.exp(sim) * (~diag).float()
         denom = sim_exp.sum(dim=1)  # [N]
 
