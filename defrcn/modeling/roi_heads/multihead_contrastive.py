@@ -223,7 +223,7 @@ class MultiHeadContrastive(nn.Module):
 
 
 
-def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor, fg_mask: torch.Tensor,
+    def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor, fg_mask: torch.Tensor,
                                   ignore_mask: torch.Tensor, iou_weight: torch.Tensor):
         """
         Implements:

@@ -535,8 +535,8 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             use_iou_reweight = getattr(c_cfg, "USE_IOU_REWEIGHT", True)
             bg_as_neg_only = getattr(c_cfg, "BG_AS_NEG_ONLY", True)
             loss_weights = (
-                getattr(c_cfg, "FG_BG_WEIGHT", 0.5),
-                getattr(c_cfg, "CLASS_WEIGHT", 0.5),
+                getattr(c_cfg, "FG_BG_WEIGHT", .3), # .3 and .7 produces best till now - 53.09% , .0 and .7 gives 50%, new head gives 53.8%
+                getattr(c_cfg, "CLASS_WEIGHT", 0),
             )
             feat_dim_cfg = getattr(c_cfg, "FEAT_DIM", None)
         else:
@@ -547,7 +547,7 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             iou_threshold = 0.7
             use_iou_reweight = True
             bg_as_neg_only = True
-            loss_weights = (0.5, 0.5)
+            loss_weights = (0.3, 0.0)
             feat_dim_cfg = None
 
         # Infer feature dim:

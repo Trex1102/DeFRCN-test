@@ -102,4 +102,3 @@ class GeneralizedRCNN(nn.Module):
         return lambda x: (x - pixel_mean) / pixel_std
             
 
-
