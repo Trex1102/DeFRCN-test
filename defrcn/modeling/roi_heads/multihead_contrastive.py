@@ -174,49 +174,118 @@ class MultiHeadContrastive(nn.Module):
         # normalize by sum of weights (so that absolute scale is stable)
         return per_anchor_losses.sum() / (per_anchor_weights.sum() + EPS)
 
-    def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor, fg_mask: torch.Tensor,
-                                      ignore_mask: torch.Tensor, iou_weight: torch.Tensor):
+    # def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor, fg_mask: torch.Tensor,
+    #                                   ignore_mask: torch.Tensor, iou_weight: torch.Tensor):
+    #     """
+    #     Supervised contrastive on class labels. Only anchors that are foreground (labels>0) are considered.
+    #     Positives for anchor i are other proposals with same class label.
+    #     IoU weight applied per anchor (as in FSCE).
+    #     """
+    #     device = z_cls.device
+    #     N = z_cls.shape[0]
+
+    #     anchor_mask = fg_mask.clone() & (~ignore_mask)
+
+    #     labels_expand = labels.unsqueeze(0).expand(N, N)
+    #     pos_mask = (labels_expand == labels_expand.T) & (~ignore_mask.unsqueeze(0).expand(N, N))
+        
+
+    #     pos_mask = pos_mask & (labels_expand != 0)
+
+    #     # compute per-anchor numerator/denom like supcon
+    #     sim = torch.matmul(z_cls, z_cls.T) / self.tau
+    #     diag = torch.eye(N, dtype=torch.bool, device=device)
+        
+    #     sim_exp = torch.exp(sim) * (~diag).float()
+    #     denom = sim_exp.sum(dim=1)  # [N]
+
+    #     per_anchor_losses = []
+    #     per_anchor_weights = []
+    #     for i in torch.nonzero(anchor_mask, as_tuple=False).view(-1):
+    #         i = int(i.item())
+    #         positives = pos_mask[i].clone()
+    #         positives[i] = False
+    #         n_pos = positives.sum().item()
+    #         if n_pos == 0:
+    #             continue
+    #         numer = (torch.exp(sim[i]) * positives.float()).sum()
+    #         den = denom[i] + EPS
+    #         loss_i = -torch.log((numer + EPS) / (den + EPS))
+    #         w = iou_weight[i] if self.use_iou_reweight else 1.0
+    #         per_anchor_losses.append(loss_i * w)
+    #         per_anchor_weights.append(w)
+
+    #     if len(per_anchor_losses) == 0:
+    #         return torch.tensor(0., device=device, requires_grad=True)
+    #     per_anchor_losses = torch.stack(per_anchor_losses)
+    #     per_anchor_weights = torch.tensor(per_anchor_weights, device=device)
+    #     return per_anchor_losses.sum() / (per_anchor_weights.sum() + EPS)
+
+
+
+def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor, fg_mask: torch.Tensor,
+                                  ignore_mask: torch.Tensor, iou_weight: torch.Tensor):
         """
-        Supervised contrastive on class labels. Only anchors that are foreground (labels>0) are considered.
-        Positives for anchor i are other proposals with same class label.
-        IoU weight applied per anchor (as in FSCE).
+        Implements:
+        L = (1 / sum_w) * sum_i w_i * L_{z_i}
+        where
+        L_{z_i} = - (1 / n_pos) * sum_{j in P(i)} log( exp(sim_ij) / sum_{k != i, not ignored} exp(sim_ik) )
+        and P(i) are positives (same class, label != 0, not ignored).
         """
         device = z_cls.device
         N = z_cls.shape[0]
+        EPS = 1e-8
 
-        anchor_mask = fg_mask.clone() & (~ignore_mask)
+        anchor_mask = fg_mask.clone() & (~ignore_mask)           # which anchors to compute loss for
 
-        labels_expand = labels.unsqueeze(0).expand(N, N)
+        # pairwise same-label positives (exclude ignored proposals)
+        labels_expand = labels.unsqueeze(0).expand(N, N)         # [N, N]
         pos_mask = (labels_expand == labels_expand.T) & (~ignore_mask.unsqueeze(0).expand(N, N))
-        
+        pos_mask = pos_mask & (labels_expand != 0)              # remove label 0 as positive
 
-        pos_mask = pos_mask & (labels_expand != 0)
-
-        # compute per-anchor numerator/denom like supcon
-        sim = torch.matmul(z_cls, z_cls.T) / self.tau
+        # pairwise similarity
+        sim = torch.matmul(z_cls, z_cls.T) / self.tau            # [N, N]
         diag = torch.eye(N, dtype=torch.bool, device=device)
-        
-        sim_exp = torch.exp(sim) * (~diag).float()
-        denom = sim_exp.sum(dim=1)  # [N]
+
+        # build valid mask for denominator: exclude self and ignored items
+        valid_for_den = (~diag) & (~ignore_mask.unsqueeze(0).expand(N, N))
+
+        # compute exponentials only where valid (to exclude ignored in denom)
+        sim_exp = torch.exp(sim) * valid_for_den.float()        # [N, N]
+        denom = sim_exp.sum(dim=1) + EPS                        # [N]
 
         per_anchor_losses = []
         per_anchor_weights = []
-        for i in torch.nonzero(anchor_mask, as_tuple=False).view(-1):
-            i = int(i.item())
+        for i_idx in torch.nonzero(anchor_mask, as_tuple=False).view(-1):
+            i = int(i_idx.item())
             positives = pos_mask[i].clone()
             positives[i] = False
-            n_pos = positives.sum().item()
+            n_pos = int(positives.sum().item())
             if n_pos == 0:
                 continue
-            numer = (torch.exp(sim[i]) * positives.float()).sum()
-            den = denom[i] + EPS
-            loss_i = -torch.log((numer + EPS) / (den + EPS))
-            w = iou_weight[i] if self.use_iou_reweight else 1.0
+
+            # numerator exponentials for positives (only those not ignored and same class)
+            numer_exp = (torch.exp(sim[i]) * positives.float())   # [N]
+
+            # probabilities for each positive: exp(sim_ij) / denom_i
+            probs = numer_exp / (denom[i] + EPS)                 # [N]
+
+            # per-anchor loss = average negative log probability over positives
+            # add EPS for numerical safety inside log
+            loss_i = - (torch.log(probs + EPS).sum()) / float(n_pos)
+
+            # IoU reweight if requested (f(u_i))
+            w = iou_weight[i] if getattr(self, "use_iou_reweight", False) else 1.0
+
             per_anchor_losses.append(loss_i * w)
             per_anchor_weights.append(w)
 
         if len(per_anchor_losses) == 0:
             return torch.tensor(0., device=device, requires_grad=True)
-        per_anchor_losses = torch.stack(per_anchor_losses)
-        per_anchor_weights = torch.tensor(per_anchor_weights, device=device)
-        return per_anchor_losses.sum() / (per_anchor_weights.sum() + EPS)
+
+        per_anchor_losses = torch.stack(per_anchor_losses)               # [M]
+        per_anchor_weights = torch.tensor(per_anchor_weights, device=device)  # [M]
+
+        # weighted average over anchors (matches 1/N sum f(u_i) * L_z_i up to normalization by sum_w)
+        loss = per_anchor_losses.sum() / (per_anchor_weights.sum() + EPS)
+        return loss
