@@ -291,7 +291,7 @@ class MultiHeadContrastive(nn.Module):
     #     return loss
 
 
-    def _class_supervised_contrastive_stable(self, z_cls: torch.Tensor, labels: torch.Tensor,
+    def _class_supervised_contrastive(self, z_cls: torch.Tensor, labels: torch.Tensor,
                                          fg_mask: torch.Tensor, ignore_mask: torch.Tensor,
                                          iou_weight: torch.Tensor):
         device = z_cls.device
@@ -359,7 +359,7 @@ class MultiHeadContrastive(nn.Module):
             return torch.tensor(0., device=device, requires_grad=True)
 
         per_anchor_losses = torch.stack(per_anchor_losses)
-        per_anchor_weights = torch.tensor(per_anchor_weights, device=device, device=device)
+        per_anchor_weights = torch.tensor(per_anchor_weights, device=device)
 
         loss = per_anchor_losses.sum() / (per_anchor_weights.sum() + EPS)
         return loss
