@@ -10,7 +10,7 @@ from detectron2.structures import Boxes
 
 
 cfg = get_cfg()
-cfg.merge_from_file("configs/Base-RCNN.yaml")
+cfg.merge_from_file("configs/VAE-RCNN.yaml")
 cfg.MODEL.WEIGHTS = "checkpoints/voc/1/defrcn_det_r101_base1/model_final.pth"
 # cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.0
 predictor = DefaultPredictor(cfg)
