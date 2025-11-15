@@ -547,7 +547,7 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             iou_threshold = 0.7
             use_iou_reweight = True
             bg_as_neg_only = True
-            loss_weights = (0.0, 0.0)
+            loss_weights = (0.0, 0.0) # changed from 0.3 to 0.0
             feat_dim_cfg = None
 
         # Infer feature dim:
