@@ -10,15 +10,15 @@ from detectron2.structures import Boxes
 
 
 cfg = get_cfg()
-cfg.merge_from_file("path/to/defrcn/config.yaml")
-cfg.MODEL.WEIGHTS = "path/to/defrcn_checkpoint.pth"
-cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.0
+cfg.merge_from_file("configs/Base-RCNN.yaml")
+cfg.MODEL.WEIGHTS = "checkpoints/voc/1/defrcn_det_r101_base1/model_final.pth"
+# cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.0
 predictor = DefaultPredictor(cfg)
 model = predictor.model
 model.eval()
 
 
-dataset_name = "voc_2007_trainval_base1,voc_2012_trainval_base1"   # register or use existing
+dataset_name = ["voc_2007_trainval_base1,voc_2012_trainval_base1"]   # register or use existing
 data_loader = build_detection_test_loader(cfg, dataset_name)
 
 # ---- Where to save ----
@@ -59,10 +59,10 @@ def extract():
             scores = torch.softmax(pred_logits, dim=1).cpu().numpy()
             np.savez_compressed(
                 os.path.join(out_dir, f"{img_id}.npz"),
-                feats=box_features.cpu().numpy(),  # NxD
-                boxes=gt_boxes.cpu().numpy(),      # Nx4
-                classes=gt_classes,                # Nx
-                scores=scores                      # NxC
+                feats=box_features.cpu().numpy(),  
+                boxes=gt_boxes.cpu().numpy(),      
+                classes=gt_classes,                
+                scores=scores                      
             )
 
 if __name__=="__main__":
