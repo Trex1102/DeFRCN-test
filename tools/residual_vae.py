@@ -143,26 +143,26 @@ def train_vae(
 
 
 
-
 import argparse
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
 import os
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# Assume ResidualDataset, ResidualVAE, and vae_loss are defined as before
+# Assume ResidualDataset, ResidualVAE, vae_loss are defined as before
 
 def main():
-    parser = argparse.ArgumentParser(description="Train improved Residual VAE for DeFRCN features")
-    parser.add_argument("--residuals_path", type=str, default="data/residuals.npy")
-    parser.add_argument("--output_path", type=str, default="vae_residuals_improved.pth")
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--latent_dim", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--beta", type=float, default=0.5, help="KL weight for beta-VAE")
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser = argparse.ArgumentParser(description="Train Residual VAE with LR scheduler & early stopping")
+    parser.add_argument("--residuals_path", type=str, default="data/residuals/residuals.npy",
+                        help="Path to residuals.npy file")
+    parser.add_argument("--output_path", type=str, default="vae_residuals.pth",
+                        help="Path to save trained VAE model")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension of VAE")
+    parser.add_argument("--epochs", type=int, default=1000, help="Maximum number of epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--patience", type=int, default=50, help="Early stopping patience (epochs)")
     args = parser.parse_args()
 
     # -----------------------
@@ -172,13 +172,17 @@ def main():
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
     # -----------------------
-    # Model and Optimizer
+    # Model, Optimizer, Scheduler
     # -----------------------
     model = ResidualVAE(latent_dim=args.latent_dim).cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
 
-    # Cosine annealing scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    # -----------------------
+    # Early Stopping Setup
+    # -----------------------
+    best_loss = float('inf')
+    epochs_no_improve = 0
 
     # -----------------------
     # Training Loop
@@ -191,33 +195,42 @@ def main():
         for x in loader:
             x = x.cuda()
             recon, mu, logvar = model(x)
-            recon_loss, kl_loss = nn.functional.mse_loss(recon, x, reduction="mean"), \
-                                  -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = recon_loss + args.beta * kl_loss  # β-VAE
+            loss, rl, kl = vae_loss(recon, x, mu, logvar)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-            total_recon += recon_loss.item()
-            total_kl += kl_loss.item()
+            total_recon += rl.item()
+            total_kl += kl.item()
 
-        scheduler.step()  # update LR
+        avg_loss = total_loss / len(loader)
+        avg_recon = total_recon / len(loader)
+        avg_kl = total_kl / len(loader)
 
         print(f"[Epoch {epoch+1}/{args.epochs}] "
-              f"Loss: {total_loss/len(loader):.4f} | "
-              f"Recon: {total_recon/len(loader):.4f} | "
-              f"KL: {total_kl/len(loader):.4f} | "
-              f"LR: {scheduler.get_last_lr()[0]:.6f}")
+              f"Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f}")
 
-        # Save checkpoint each epoch
-        torch.save({
-            "model": model.state_dict(),
-            "latent_dim": args.latent_dim
-        }, args.output_path)
+        # Scheduler step based on avg_loss
+        scheduler.step(avg_loss)
 
-    print(f"Training complete. Improved VAE saved to {args.output_path}")
+        # Early Stopping check
+        if avg_loss < best_loss - 1e-5:  # small threshold to avoid float issues
+            best_loss = avg_loss
+            epochs_no_improve = 0
+            # Save best model
+            torch.save({
+                "model": model.state_dict(),
+                "latent_dim": args.latent_dim
+            }, args.output_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                print(f"Early stopping triggered after {epoch+1} epochs.")
+                break
+
+    print(f"Training complete. Best VAE saved to {args.output_path}")
 
 if __name__ == "__main__":
     main()
