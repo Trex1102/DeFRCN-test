@@ -34,7 +34,7 @@ def extract_dataset(dataset_name):
     Extract RoI box-head features for GT boxes in dataset_name and save per-image .npz files
     into out_dir with filenames like: {dataset_name}__{img_id}.npz
     """
-    # Use deterministic test loader (no train-time augmentation)
+    
     data_loader = build_detection_test_loader(cfg, dataset_name)
 
     print(f"Extracting dataset {dataset_name} with approximately {len(data_loader)} batches")
@@ -44,12 +44,12 @@ def extract_dataset(dataset_name):
 
     for batch_idx, inputs in enumerate(tqdm.tqdm(data_loader, desc=f"Extract {dataset_name}")):
         t0 = time.time()
-        # Preprocess images and compute backbone features
-        images = model.preprocess_image(inputs)          # ImageList on device
-        features = model.backbone(images.tensor)         # OrderedDict of feature maps
+        
+        images = model.preprocess_image(inputs)          
+        features = model.backbone(images.tensor)         
         t_backbone = time.time()
 
-        # Build list of Boxes per image using GT boxes (we extract GT RoIs)
+        
         boxes_per_image = []
         counts = []
         img_ids = []
@@ -73,18 +73,18 @@ def extract_dataset(dataset_name):
                         img_id = f"{batch_idx}_{len(img_ids)}"
                 img_ids.append(str(img_id))
 
-        # Skip if this batch has no GT boxes
+        
         if sum(counts) == 0:
             # small print occasionally
             if (batch_idx % 200) == 0:
                 print(f"[{dataset_name}] batch {batch_idx}: no GT boxes, skipping")
             continue
 
-        # IMPORTANT: Res5ROIHeads._shared_roi_transform expects list(features[f] for f in in_features)
+        
         in_features = model.roi_heads.in_features  # e.g. ['res4']
         feature_list = [features[f] for f in in_features]
 
-        # Call the same transform used in Res5ROIHeads -> get pooled features (N_total, C, H, W)
+        
         try:
             pooled = model.roi_heads._shared_roi_transform(feature_list, boxes_per_image)
         except Exception:
@@ -93,22 +93,21 @@ def extract_dataset(dataset_name):
 
         t_pool = time.time()
 
-        # Run the box_head to get the final per-ROI vector used by predictor
-        # Many implementations: box_features = model.roi_heads.box_head(pooled)
+        
         try:
-            box_features = model.roi_heads.box_head(pooled)  # expected shape (N_total, D) or (N, D, 1, 1)
+            box_features = model.roi_heads.box_head(pooled)  
         except Exception:
             # fallback: flatten then call head
             pooled_flat = pooled.flatten(start_dim=1)
             box_features = model.roi_heads.box_head(pooled_flat)
 
-        # Ensure we have (N, D)
+        
         if box_features.ndim == 4 and box_features.shape[2] == 1 and box_features.shape[3] == 1:
             box_features = box_features.view(box_features.shape[0], -1)
 
         t_box_head = time.time()
 
-        # Predictor to obtain logits (and optionally bbox deltas)
+        
         scores = None
         try:
             with torch.no_grad():
