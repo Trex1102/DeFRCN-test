@@ -21,7 +21,7 @@ model = predictor.model
 model.eval()
 device = next(model.parameters()).device
 
-dataset_names = "voc_2007_trainval_base1"
+dataset_names = ["voc_2007_trainval_base1","voc_2012_trainval_base1"]
 
 # dataset_names = "voc_2012_trainval_base1"
 
