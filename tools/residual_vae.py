@@ -144,18 +144,25 @@ def train_vae(
 
 
 
+import argparse
+import torch
+from torch.utils.data import DataLoader
+import numpy as np
+import os
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# Assume ResidualDataset, ResidualVAE, and vae_loss are defined as before
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Residual VAE for DeFRCN features")
-    parser.add_argument("--residuals_path", type=str, default="data/residuals/residuals.npy",
-                        help="Path to residuals.npy file")
-    parser.add_argument("--output_path", type=str, default="vae_residuals.pth",
-                        help="Path to save trained VAE model")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
-    parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension of VAE")
-    parser.add_argument("--epochs", type=int, default=60, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--num_workers", type=int, default=1, help="DataLoader workers")
+    parser = argparse.ArgumentParser(description="Train improved Residual VAE for DeFRCN features")
+    parser.add_argument("--residuals_path", type=str, default="data/residuals.npy")
+    parser.add_argument("--output_path", type=str, default="vae_residuals_improved.pth")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--latent_dim", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--beta", type=float, default=0.5, help="KL weight for beta-VAE")
+    parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
     # -----------------------
@@ -170,6 +177,9 @@ def main():
     model = ResidualVAE(latent_dim=args.latent_dim).cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    # Cosine annealing scheduler
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+
     # -----------------------
     # Training Loop
     # -----------------------
@@ -181,20 +191,25 @@ def main():
         for x in loader:
             x = x.cuda()
             recon, mu, logvar = model(x)
-            loss, rl, kl = vae_loss(recon, x, mu, logvar)
+            recon_loss, kl_loss = nn.functional.mse_loss(recon, x, reduction="mean"), \
+                                  -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            loss = recon_loss + args.beta * kl_loss  # β-VAE
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-            total_recon += rl.item()
-            total_kl += kl.item()
+            total_recon += recon_loss.item()
+            total_kl += kl_loss.item()
+
+        scheduler.step()  # update LR
 
         print(f"[Epoch {epoch+1}/{args.epochs}] "
               f"Loss: {total_loss/len(loader):.4f} | "
               f"Recon: {total_recon/len(loader):.4f} | "
-              f"KL: {total_kl/len(loader):.4f}")
+              f"KL: {total_kl/len(loader):.4f} | "
+              f"LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # Save checkpoint each epoch
         torch.save({
@@ -202,7 +217,7 @@ def main():
             "latent_dim": args.latent_dim
         }, args.output_path)
 
-    print(f"Training complete. VAE saved to {args.output_path}")
+    print(f"Training complete. Improved VAE saved to {args.output_path}")
 
 if __name__ == "__main__":
     main()
