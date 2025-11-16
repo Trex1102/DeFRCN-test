@@ -93,7 +93,7 @@ def vae_loss(recon_x, x, mu, logvar):
 # ============================================================
 
 def train_vae(
-    residuals_path="data/residuals/residuals.npy",,
+    residuals_path="data/residuals/residuals.npy",
     output_path="vae_residuals.pth",
     batch_size=128,
     latent_dim=256,
@@ -153,7 +153,7 @@ def main():
                         help="Path to save trained VAE model")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension of VAE")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=60, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--num_workers", type=int, default=1, help="DataLoader workers")
     args = parser.parse_args()
