@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import argparse
 
 # ============================================================
 #  Dataset: loads residuals saved as .npz
@@ -139,3 +140,69 @@ def train_vae(
 
     print(f"VAE saved to {output_path}")
     return model
+
+
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train Residual VAE for DeFRCN features")
+    parser.add_argument("--residuals_path", type=str, default="data/residuals/residuals.npy",
+                        help="Path to residuals.npy file")
+    parser.add_argument("--output_path", type=str, default="vae_residuals.pth",
+                        help="Path to save trained VAE model")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension of VAE")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--num_workers", type=int, default=1, help="DataLoader workers")
+    args = parser.parse_args()
+
+    # -----------------------
+    # Dataset and DataLoader
+    # -----------------------
+    dataset = ResidualDataset(args.residuals_path)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+
+    # -----------------------
+    # Model and Optimizer
+    # -----------------------
+    model = ResidualVAE(latent_dim=args.latent_dim).cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    # -----------------------
+    # Training Loop
+    # -----------------------
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0
+        total_recon = 0
+        total_kl = 0
+        for x in loader:
+            x = x.cuda()
+            recon, mu, logvar = model(x)
+            loss, rl, kl = vae_loss(recon, x, mu, logvar)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_recon += rl.item()
+            total_kl += kl.item()
+
+        print(f"[Epoch {epoch+1}/{args.epochs}] "
+              f"Loss: {total_loss/len(loader):.4f} | "
+              f"Recon: {total_recon/len(loader):.4f} | "
+              f"KL: {total_kl/len(loader):.4f}")
+
+        # Save checkpoint each epoch
+        torch.save({
+            "model": model.state_dict(),
+            "latent_dim": args.latent_dim
+        }, args.output_path)
+
+    print(f"Training complete. VAE saved to {args.output_path}")
+
+if __name__ == "__main__":
+    main()
