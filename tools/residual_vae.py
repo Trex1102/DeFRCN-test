@@ -141,14 +141,6 @@ def train_vae(
     print(f"VAE saved to {output_path}")
     return model
 
-
-
-import argparse
-import torch
-from torch.utils.data import DataLoader
-import numpy as np
-import os
-
 # Assume ResidualDataset, ResidualVAE, vae_loss are defined as before
 
 def main():
