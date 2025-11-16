@@ -7,6 +7,7 @@ from detectron2.engine import DefaultPredictor
 from detectron2.data import build_detection_test_loader
 from detectron2.config import get_cfg
 from detectron2.structures import Boxes
+import defrcn.data.datasets
 
 # ---------------- CONFIG ----------------
 cfg = get_cfg()
