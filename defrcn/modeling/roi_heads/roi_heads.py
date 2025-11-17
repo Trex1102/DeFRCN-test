@@ -535,8 +535,8 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             use_iou_reweight = getattr(c_cfg, "USE_IOU_REWEIGHT", True)
             bg_as_neg_only = getattr(c_cfg, "BG_AS_NEG_ONLY", True)
             loss_weights = (
-                getattr(c_cfg, "FG_BG_WEIGHT", 0), 
-                getattr(c_cfg, "CLASS_WEIGHT", 0.0), 
+                getattr(c_cfg, "FG_BG_WEIGHT", 0.2), 
+                getattr(c_cfg, "CLASS_WEIGHT", 0.5), 
             )
             feat_dim_cfg = getattr(c_cfg, "FEAT_DIM", None)
         else:
