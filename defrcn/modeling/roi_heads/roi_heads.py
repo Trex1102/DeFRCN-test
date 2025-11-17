@@ -535,8 +535,8 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             use_iou_reweight = getattr(c_cfg, "USE_IOU_REWEIGHT", True)
             bg_as_neg_only = getattr(c_cfg, "BG_AS_NEG_ONLY", True)
             loss_weights = (
-                getattr(c_cfg, "FG_BG_WEIGHT", 0), # .3 and .7 produces best till now - 53.09% , .0 and .7 gives 50%, new head gives 53.8%
-                getattr(c_cfg, "CLASS_WEIGHT", 0.0), # .3, 0 -> 53.56, 0, 0 -> 50, brand new .3, .7 -> 51, .5, .5 -> 51 , (0, .5) -> 53, 
+                getattr(c_cfg, "FG_BG_WEIGHT", 0), 
+                getattr(c_cfg, "CLASS_WEIGHT", 0.0), 
             )
             feat_dim_cfg = getattr(c_cfg, "FEAT_DIM", None)
         else:
@@ -550,8 +550,6 @@ class MultiHeadContrastiveHead(Res5ROIHeads):
             loss_weights = (0.0, 0.0) # changed from 0.3 to 0.0
             feat_dim_cfg = None
 
-        # Infer feature dim:
-        # Priority: cfg.MODEL.CONTRASTIVE.FEAT_DIM -> try to infer from res5 -> fallback to 2048
         if feat_dim_cfg is not None:
             feat_dim = int(feat_dim_cfg)
         else:
