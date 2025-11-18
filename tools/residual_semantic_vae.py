@@ -27,11 +27,16 @@ class CondResidualVAE(nn.Module):
 
         self.enc_fcx = nn.Linear(resid_dim, hidden_h)
         self.enc_fcy = nn.Linear(sem_dim, hidden_h)
+
         self.enc_fc1 = nn.Linear(hidden_h*2, hidden_h)
+        self.enc_fc2 = nn.Linear(hidden_h, hidden_h)
         self.enc_fc3 = nn.Linear(hidden_h, hidden_h)
+
+
         self.enc_mu = nn.Linear(hidden_h, latent_dim)
         self.enc_logvar = nn.Linear(hidden_h, latent_dim)
         self.enc_act = nn.LeakyReLU(leaky_slope, inplace=True)
+
 
         # Prior: maps semantic vector -> mu_p, logvar_p (uses same hidden size)
         self.prior_fc1 = nn.Linear(sem_dim, hidden_h)
@@ -40,9 +45,15 @@ class CondResidualVAE(nn.Module):
         self.prior_logvar = nn.Linear(hidden_h, latent_dim)
         self.prior_act = nn.LeakyReLU(leaky_slope, inplace=True)
 
+
         # Decoder: input = z concat sem
-        self.dec_fc1 = nn.Linear(latent_dim + sem_dim, hidden_h)
+        self.dec_fcx = nn.Linear(latent_dim, hidden_h)
+        self.dec_fcy = nn.Linear(sem_dim, hidden_h)
+
+        self.dec_fc1 = nn.Linear(hidden_h*2, hidden_h)
+        
         self.dec_out = nn.Linear(hidden_h, resid_dim)
+
         self.dec_hidden_act = nn.LeakyReLU(leaky_slope, inplace=True)
         self.dec_out_act = nn.Identity()  # keep linear output (residual scale preserved)
 
@@ -55,11 +66,16 @@ class CondResidualVAE(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def encode(self, resid):
-        x = self.enc_act(self.enc_fc1(resid))
+    def encode(self, resid, sem):
+        x = self.enc_act(self.enc_fcx(resid))
+        y = self.enc_act(self.enc_fct(sem))
+        x = torch.cat([x,y], dim =1)
+
+        x = self.enc_act(self.enc_fc1(x))
         x = self.enc_act(self.enc_fc2(x))
         x = self.enc_act(self.enc_fc3(x))
-        x = self.enc_act(self.enc_fc4(x))
+
+
         mu = self.enc_mu(x)
         logvar = self.enc_logvar(x)
         return mu, logvar
@@ -77,14 +93,18 @@ class CondResidualVAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z, sem):
-        x = torch.cat([z, sem], dim=1)
+        x = self.dec_hidden_act(self.dec_fcx(sem))
+        y = self.dec_hidden_act(self.dec_fcy(z))
+        
+        x = torch.cat([x,y], dim =1)
+
         x = self.dec_hidden_act(self.dec_fc1(x))
         x = self.dec_out(x)
         x = self.dec_out_act(x)
         return x
 
     def forward(self, resid, sem):
-        mu_q, logvar_q = self.encode(resid)
+        mu_q, logvar_q = self.encode(resid, sem)
         z = self.reparam(mu_q, logvar_q)
         mu_p, logvar_p = self.prior(sem)
         recon = self.decode(z, sem)
