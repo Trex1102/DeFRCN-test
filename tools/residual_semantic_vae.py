@@ -68,7 +68,7 @@ class CondResidualVAE(nn.Module):
 
     def encode(self, resid, sem):
         x = self.enc_act(self.enc_fcx(resid))
-        y = self.enc_act(self.enc_fct(sem))
+        y = self.enc_act(self.enc_fcy(sem))
         x = torch.cat([x,y], dim =1)
 
         x = self.enc_act(self.enc_fc1(x))
@@ -306,7 +306,7 @@ def parse_args():
     p.add_argument("--out", type=str, default="cvae_best.pth")
     p.add_argument("--resid_dim", type=int, default=2048)
     p.add_argument("--sem_dim", type=int, default=512)
-    p.add_argument("--latent_dim", type=int, default=128)
+    p.add_argument("--latent_dim", type=int, default=512)
     p.add_argument("--hidden_h", type=int, default=4096)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=2000)
