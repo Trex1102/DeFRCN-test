@@ -6,12 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# ---------------------------
-# (Paste of the model & helper functions you already provided)
-# ---------------------------
-# CondResidualVAE and kl_divergence_gaussians are reused from user code.
-# I include them here verbatim (with small compatibility fixes).
-
 class ResidualCondDataset(Dataset):
     def __init__(self, residuals_path, anchors_path, labels_path):
         self.residuals = np.load(residuals_path).astype(np.float32)
@@ -29,9 +23,11 @@ class ResidualCondDataset(Dataset):
 class CondResidualVAE(nn.Module):
     def __init__(self, resid_dim=2048, sem_dim=512, latent_dim=512, hidden_h=4096, leaky_slope=0.2):
         super().__init__()
-        # Encoder: input = resid only (no semantic concatenation)
-        self.enc_fc1 = nn.Linear(resid_dim, hidden_h)
-        self.enc_fc2 = nn.Linear(hidden_h, hidden_h)
+
+
+        self.enc_fcx = nn.Linear(resid_dim, hidden_h)
+        self.enc_fcy = nn.Linear(sem_dim, hidden_h)
+        self.enc_fc1 = nn.Linear(hidden_h*2, hidden_h)
         self.enc_fc3 = nn.Linear(hidden_h, hidden_h)
         self.enc_mu = nn.Linear(hidden_h, latent_dim)
         self.enc_logvar = nn.Linear(hidden_h, latent_dim)
@@ -63,6 +59,7 @@ class CondResidualVAE(nn.Module):
         x = self.enc_act(self.enc_fc1(resid))
         x = self.enc_act(self.enc_fc2(x))
         x = self.enc_act(self.enc_fc3(x))
+        x = self.enc_act(self.enc_fc4(x))
         mu = self.enc_mu(x)
         logvar = self.enc_logvar(x)
         return mu, logvar
