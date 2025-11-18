@@ -258,12 +258,12 @@ def train(
 # ---------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--residuals_path", type=str,  default="data/residuals/residuals.npy")
-    p.add_argument("--residuals_anchor_path", type=str, default="data/residuals/residuals_anchors.npy")
-    p.add_argument("--residuals_labels_path", type=str, default="data/residuals/residuals_labels.npy")
-    p.add_argument("--class_names_path", type=str, default="data/class_names.txt")
-    p.add_argument("--class_embeds_path", type=str, default="data/class_embeds.npy")
-    p.add_argument("--output_path", type=str, default="model/cvae_best.pth")
+    p.add_argument("--residuals", type=str,  default="data/residuals/residuals.npy")
+    p.add_argument("--anchors", type=str, default="data/residuals/residuals_anchors.npy")
+    p.add_argument("--labels", type=str, default="data/residuals/residuals_labels.npy")
+    p.add_argument("--class_names", type=str, default="data/class_names.txt")
+    p.add_argument("--class_embeds", type=str, default="data/class_embeds.npy")
+    p.add_argument("--out", type=str, default="model/cvae_best.pth")
     p.add_argument("--resid_dim", type=int, default=2048)
     p.add_argument("--sem_dim", type=int, default=512)
     p.add_argument("--latent_dim", type=int, default=512)
