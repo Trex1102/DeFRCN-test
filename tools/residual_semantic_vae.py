@@ -138,14 +138,15 @@ def train(
     out_path,
     resid_dim=2048,
     sem_dim=512,
-    latent_dim=512,
+    latent_dim=128,
     hidden_h=4096,
     batch_size=256,
     epochs=1000,
     lr=1e-4,
     beta_start=0.0,
     beta_end=1.0,
-    kl_anneal_steps=20000,
+    kl_anneal_steps=100000,
+    kl_free_bits = 1,
     patience=50,
     device="cuda",
     use_pca=False
@@ -189,8 +190,24 @@ def train(
         epoch_kl = 0.0
         for resid_np, anchor_np, labels_np in loader:
             global_step += 1
-            resid = torch.from_numpy(resid_np).float().to(device)   # normalized residuals
-            labels = torch.from_numpy(labels_np).long().to(device)
+            # resid = torch.from_numpy(resid_np).float().to(device)   # normalized residuals
+            # labels = torch.from_numpy(labels_np).long().to(device)
+
+
+            # convert to tensor only if not already tensor
+            if isinstance(resid_np, np.ndarray):
+                resid = torch.from_numpy(resid_np).float()
+            else:
+                resid = resid_np.float()
+
+            if isinstance(labels_np, np.ndarray):
+                labels = torch.from_numpy(labels_np).long()
+            else:
+                labels = labels_np.long()
+
+            resid = resid.to(device)
+            labels = labels.to(device)
+
 
             # gather semantic embeddings for this batch
             sem = class_embeds[labels]   # (B, sem_dim)
@@ -201,6 +218,12 @@ def train(
             # losses
             rec_loss = F.mse_loss(recon, resid, reduction="mean")
             kl_loss = kl_divergence_gaussians(mu_q, logvar_q, mu_p, logvar_p)
+            
+            # Apply Free Bits constraint: only penalize KL if it exceeds the budget
+            if kl_free_bits > 0.0:
+                kl_penalty = torch.max(kl_loss, torch.tensor(kl_free_bits).to(kl_loss.device))
+            else:
+                kl_penalty = kl_loss # Standard KL when free_bits is 0
 
             # KL anneal schedule (linear anneal from beta_start -> beta_end over kl_anneal_steps)
             if kl_anneal_steps > 0:
@@ -209,7 +232,7 @@ def train(
             else:
                 beta = beta_end
 
-            loss = rec_loss + beta * kl_loss
+            loss = rec_loss + beta * kl_penalty
 
             optimizer.zero_grad()
             loss.backward()
@@ -263,17 +286,18 @@ def parse_args():
     p.add_argument("--labels", type=str, default="data/residuals/residuals_labels.npy")
     p.add_argument("--class_names", type=str, default="data/class_names.txt")
     p.add_argument("--class_embeds", type=str, default="data/class_embeds.npy")
-    p.add_argument("--out", type=str, default="model/cvae_best.pth")
+    p.add_argument("--out", type=str, default="cvae_best.pth")
     p.add_argument("--resid_dim", type=int, default=2048)
     p.add_argument("--sem_dim", type=int, default=512)
-    p.add_argument("--latent_dim", type=int, default=512)
+    p.add_argument("--latent_dim", type=int, default=128)
     p.add_argument("--hidden_h", type=int, default=4096)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--beta_start", type=float, default=0.0)
     p.add_argument("--beta_end", type=float, default=1.0)
-    p.add_argument("--kl_anneal_steps", type=int, default=20000)
+    p.add_argument("--kl_anneal_steps", type=int, default=100000)
+    p.add_argument("--kl_free_bits", type=float, default=1)
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--device", type=str, default="cuda")
     return p.parse_args()
@@ -297,6 +321,7 @@ if __name__ == "__main__":
         beta_start=args.beta_start,
         beta_end=args.beta_end,
         kl_anneal_steps=args.kl_anneal_steps,
+        kl_free_bits=args.kl_free_bits,
         patience=args.patience,
         device=args.device
     )
