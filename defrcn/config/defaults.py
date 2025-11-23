@@ -23,14 +23,20 @@ _CC.MODEL.ROI_HEADS.DROPOUT_RATIO = 0.8
 _CC.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION = 7  # for faster
 
 # ------------- TEST ------------- #
-_CC.TEST.PCB_ENABLE = False
+_CC.TEST.PCB_ENABLE = FALSE
 _CC.TEST.PCB_MODELTYPE = 'resnet'             # res-like
 _CC.TEST.PCB_MODELPATH = ""
 _CC.TEST.PCB_ALPHA = 0.50
 _CC.TEST.PCB_UPPER = 1.0
 _CC.TEST.PCB_LOWER = 0.05
-_CC.TEST.PCB_REPULSION = True
+_CC.TEST.PCB_REPULSION = FALSE
 
 # ------------ Other ------------- #
 _CC.SOLVER.WEIGHT_DECAY = 5e-5
 _CC.MUTE_HEADER = True
+
+# ------------ VAE --------------- #
+_CC.VAE.ENABLE = False
+_CC.VAE.PATH = "PATH"
+_CC.VAE.CLIP_PATH = "PATH"
+
