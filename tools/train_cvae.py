@@ -18,7 +18,7 @@ OUTPUT_MODEL_PATH = "checkpoints/defrcn_vae_model.pth"
 
 # Hyperparameters
 BATCH_SIZE = 64
-LR = 1e-4
+LR = 5e-5
 EPOCHS = 50
 
 # Model Architecture Dimensions
@@ -193,22 +193,20 @@ class CondResidualVAE(nn.Module):
 #            LOSS & TRAINING
 # ==========================================
 def vae_loss_function(recon, target, mu_q, logvar_q, mu_p, logvar_p):
-    """
-    Loss = MSE + KL(Posterior || Prior)
-    """
-    # 1. Reconstruction Loss (Sum of Squared Errors)
+    # 1. Reconstruction Loss
     mse = nn.functional.mse_loss(recon, target, reduction='sum')
     
-    # 2. KL Divergence between two Gaussians
-    # q(z|x,c) ~ N(mu_q, var_q)
-    # p(z|c)   ~ N(mu_p, var_p)
+    # 2. KL Divergence Stability Fixes
+    # Clamp logvars to prevent exp() from returning Infinity or 0
+    # Range [-20, 20] is usually safe for exp()
+    logvar_q = torch.clamp(logvar_q, min=-10, max=10)
+    logvar_p = torch.clamp(logvar_p, min=-10, max=10)
+
     var_q = torch.exp(logvar_q)
     var_p = torch.exp(logvar_p)
     
-    # Analytical KL term
-    # term1 = log(var_p / var_q) -> logvar_p - logvar_q
-    # term2 = (var_q + (mu_q - mu_p)^2) / var_p
-    kl_element = 0.5 * ( (var_q + (mu_q - mu_p).pow(2)) / var_p - 1 + (logvar_p - logvar_q) )
+    # Add epsilon (1e-6) to denominator to prevent division by zero
+    kl_element = 0.5 * ( (var_q + (mu_q - mu_p).pow(2)) / (var_p + 1e-6) - 1 + (logvar_p - logvar_q) )
     kld = torch.sum(kl_element)
 
     return mse + kld, mse, kld
@@ -252,6 +250,7 @@ def main():
             loss, mse, kld = vae_loss_function(recon, visual_feat, mu_q, logvar_q, mu_p, logvar_p)
             
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             
             total_loss += loss.item()
@@ -269,7 +268,7 @@ def main():
     print(f"Saving model to {OUTPUT_MODEL_PATH}...")
     torch.save({
         'model_state_dict': model.state_dict(),
-        'feat_mean': dataset.feat_mean, # CRITICAL: Needed for un-normalizing generated features
+        'feat_mean': dataset.feat_mean, 
         'feat_std': dataset.feat_std
     }, OUTPUT_MODEL_PATH)
     
