@@ -6,9 +6,9 @@ from detectron2.data import MetadataCatalog
 import defrcn.data.builtin  # Register datasets
 
 # --- CONFIG ---
-DATASET_NAME = "voc_2012_trainval_base1"
+DATASET_NAME = "voc_2012_trainval_all1"
 CLIP_MODEL_NAME = "ViT-B/32"  # Outputs 512-dim vectors
-OUTPUT_PATH = "data/roifeats_base/clip_prototypes.npy"
+OUTPUT_PATH = "data/roifeats_base/clip_prototypes_finetune.npy"
 # --------------
 
 def generate_prototypes():
