@@ -47,7 +47,7 @@ def analyze_dataset():
         print(f"{cls_id:<5} {name:<20} {count:<10}")
 
     # --- Plotting ---
-    plt.figure(figsize=(14, 8)) # Increased height for readability
+    plt.figure(figsize=(14, 8))
     bars = plt.bar(plot_names, plot_counts, color='steelblue', edgecolor='black')
     
     # Add counts on top
