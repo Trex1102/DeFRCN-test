@@ -13,9 +13,6 @@ from .build import META_ARCH_REGISTRY
 from .gdl import decouple_layer, AffineLayer
 from defrcn.modeling.roi_heads import build_roi_heads
 
-# ===========================================================================
-# 1. DEFINE VAE CLASS (Must match the one you trained)
-# ===========================================================================
 class CondResidualVAE(nn.Module):
     def __init__(self, resid_dim=2048, sem_dim=512, latent_dim=512, hidden_h=4096, leaky_slope=0.2):
         super().__init__()
