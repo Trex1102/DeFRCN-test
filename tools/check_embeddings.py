@@ -11,10 +11,10 @@ loaded_prototypes = torch.from_numpy(loaded_prototypes).to(device).float()
 # 2. Define the ACTUAL class names your detector expects
 # These must be in the order Detectron2 sees them (0, 1, 2...)
 # Example for VOC Split 1 (check your dataset config!):
-class_names = ["aeroplane", "bicycle", "boat", "bottle", "car", 
-               "cat", "chair", "diningtable", "dog", "horse", 
-               "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor",
-               "bird", "bus", "cow", "motorbike"] 
+class_names = ["aeroplane", "bicycle", "boat", "bottle", "car",
+        "cat", "chair", "diningtable", "dog", "horse",
+        "person", "pottedplant", "sheep", "train", "tvmonitor",
+        "bird", "bus", "cow", "motorbike", "sofa",] 
 
 # 3. Load CLIP Model
 model, preprocess = clip.load("ViT-B/32", device=device)
