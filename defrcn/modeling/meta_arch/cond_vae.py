@@ -5,13 +5,8 @@ import numpy as np
 import torch.nn.functional as F
 from torch import nn
 from detectron2.structures import ImageList
-from detectron2.utils.logger import log_first_n
-from detectron2.modeling.backbone import build_backbone
-from detectron2.modeling.postprocessing import detector_postprocess
-from detectron2.modeling.proposal_generator import build_proposal_generator
-from .build import META_ARCH_REGISTRY
-from .gdl import decouple_layer, AffineLayer
-from defrcn.modeling.roi_heads import build_roi_heads
+from defrcn.modeling.meta_arch.build import META_ARCH_REGISTRY
+from defrcn.modeling.meta_arch.gdl import AffineLayer
 
 class CondResidualVAE(nn.Module):
     def __init__(self, resid_dim=2048, sem_dim=512, latent_dim=512, hidden_h=4096, leaky_slope=0.2):

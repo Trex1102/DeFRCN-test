@@ -337,15 +337,54 @@ from detectron2.utils.events import get_event_storage
 from .build import META_ARCH_REGISTRY
 from .gdl import decouple_layer, AffineLayer
 from defrcn.modeling.roi_heads import build_roi_heads
-from .cond_vae import CondResidualVAE
+
 
 __all__ = ["GeneralizedRCNN"]
+
+
+class CondResidualVAE(nn.Module):
+    def __init__(self, resid_dim=2048, sem_dim=512, latent_dim=512, hidden_h=4096, leaky_slope=0.2):
+        super().__init__()
+        # Encoder
+        self.enc_fcx = nn.Linear(resid_dim, hidden_h)
+        self.enc_fcy = nn.Linear(sem_dim, hidden_h)
+        self.enc_fc1 = nn.Linear(hidden_h*2, hidden_h)
+        self.enc_fc2 = nn.Linear(hidden_h, hidden_h)
+        self.enc_fc3 = nn.Linear(hidden_h, hidden_h)
+        self.enc_mu = nn.Linear(hidden_h, latent_dim)
+        self.enc_logvar = nn.Linear(hidden_h, latent_dim)
+        self.enc_act = nn.LeakyReLU(leaky_slope, inplace=True)
+        # Prior
+        self.prior_fc1 = nn.Linear(sem_dim, hidden_h)
+        self.prior_fc2 = nn.Linear(hidden_h, hidden_h)
+        self.prior_mu = nn.Linear(hidden_h, latent_dim)
+        self.prior_logvar = nn.Linear(hidden_h, latent_dim)
+        self.prior_act = nn.LeakyReLU(leaky_slope, inplace=True)
+        # Decoder
+        self.dec_fcx = nn.Linear(latent_dim, hidden_h)
+        self.dec_fcy = nn.Linear(sem_dim, hidden_h)
+        self.dec_fc1 = nn.Linear(hidden_h*2, hidden_h)
+        self.dec_out = nn.Linear(hidden_h, resid_dim)
+        self.dec_hidden_act = nn.LeakyReLU(leaky_slope, inplace=True)
+        self.dec_out_act = nn.Identity()
+
+    def decode(self, z, sem):
+        x = self.dec_hidden_act(self.dec_fcx(z))   
+        y = self.dec_hidden_act(self.dec_fcy(sem))
+        x = torch.cat([x,y], dim=1)
+        x = self.dec_hidden_act(self.dec_fc1(x))
+        x = self.dec_out(x)
+        x = self.dec_out_act(x)
+        return x
 
 @META_ARCH_REGISTRY.register()
 class GeneralizedRCNN(nn.Module):
 
+    
+
     def __init__(self, cfg):
         super().__init__()
+
 
         self.cfg = cfg
         self.device = torch.device(cfg.MODEL.DEVICE)
@@ -496,79 +535,114 @@ class GeneralizedRCNN(nn.Module):
     def visualize_features(self, features_dict, gt_instances, step=0):
         """
         Extracts REAL features from the current batch and plots them against SYNTHETIC features.
+        Handles both StandardROIHeads (FPN) and Res5ROIHeads (C4).
         """
         print(f"--> Generating Feature t-SNE for step {step}...")
         try:
             with torch.no_grad():
-                # 1. Extract Real Features
-                # We need to pool the features from the backbone maps
-                if self.cfg.MODEL.ROI_HEADS.ENABLE_DECOUPLE:
-                     # We already have decoupled features in 'features_dict' from _forward_once_
-                     pass 
-                
-                # Get boxes and classes
+                # --- 1. Extract Real Features ---
                 gt_boxes = [x.gt_boxes for x in gt_instances]
                 gt_classes = torch.cat([x.gt_classes for x in gt_instances]).cpu().numpy()
                 
-                # Pool features using standard ROIHeads pooler
-                # Note: We need 'features_dict' which contains the image features
-                box_features = self.roi_heads.box_pooler(
-                    [features_dict[f] for f in self.roi_heads.in_features], 
-                    gt_boxes
-                )
-                # Pass through Box Head (Res5) to get the final vector (e.g. 2048d)
-                real_feats = self.roi_heads.box_head(box_features)
+                # Determine inputs based on Head Type
+                if hasattr(self.roi_heads, "box_pooler"):
+                    # Case A: StandardROIHeads (FPN)
+                    # 1. Pool
+                    box_features = self.roi_heads.box_pooler(
+                        [features_dict[f] for f in self.roi_heads.in_features], 
+                        gt_boxes
+                    )
+                    # 2. Head (MLP) -> Output is usually a vector [N, 1024]
+                    real_feats = self.roi_heads.box_head(box_features)
+                
+                elif hasattr(self.roi_heads, "pooler"):
+                    # Case B: Res5ROIHeads (C4 Backbone - Likely your case)
+                    # 1. Pool
+                    box_features = self.roi_heads.pooler(
+                        [features_dict[f] for f in self.roi_heads.in_features], 
+                        gt_boxes
+                    )
+                    # 2. Head (Res5 Block) -> Output is [N, 2048, 7, 7]
+                    real_feats = self.roi_heads.res5(box_features)
+                    
+                    # 3. Global Average Pooling (CRITICAL for VAE comparison)
+                    # Flatten spatial dims to get [N, 2048] vector
+                    if len(real_feats.shape) == 4:
+                        real_feats = real_feats.mean(dim=[2, 3])
+                else:
+                    print("--> Error: Unknown ROIHeads structure.")
+                    return
+
                 real_feats_np = real_feats.cpu().numpy()
                 
-                # 2. Generate Synthetic Features for the same classes
+                # --- 2. Generate Synthetic Features ---
                 unique_cls = np.unique(gt_classes)
-                # Filter out background if present
-                unique_cls = unique_cls[unique_cls < len(self.clip_prototypes)]
+                # Filter background (assuming background is the highest index)
+                # Adjust this check if your background logic differs
+                if hasattr(self.roi_heads, "num_classes"):
+                    unique_cls = unique_cls[unique_cls < self.roi_heads.num_classes]
                 
                 fake_feats_list = []
                 fake_labels_list = []
                 
+                if len(unique_cls) == 0:
+                    print("--> No foreground classes in batch to visualize.")
+                    return
+
                 for cls_id in unique_cls:
                     # Handle Mapping
                     clip_id = cls_id if self.id_map is None else self.id_map[cls_id]
+                    
+                    # Safety check for CLIP index
+                    if clip_id >= len(self.clip_prototypes): continue
+
                     sem_vec = self.clip_prototypes[clip_id].unsqueeze(0).repeat(30, 1)
                     
                     # Generate
                     z = torch.randn(30, 512, device=self.device)
                     z = z / (z.norm(dim=1, keepdim=True) + 1e-6)
-                    gen = self.vae.decode(z, sem_vec)
+                    # Add mild beta variation
+                    beta = (torch.rand(30, 1, device=self.device) * 0.4) + 0.8
+                    gen = self.vae.decode(z * beta, sem_vec)
+                    
+                    # Un-normalize
                     gen = (gen * self.feat_std) + self.feat_mean
                     
                     fake_feats_list.append(gen.cpu().numpy())
                     fake_labels_list.append(np.full(30, cls_id))
                     
-                if len(fake_feats_list) == 0: return
+                if len(fake_feats_list) == 0: 
+                    print("--> Could not generate valid fake features.")
+                    return
 
                 fake_feats_np = np.concatenate(fake_feats_list, axis=0)
                 fake_labels_np = np.concatenate(fake_labels_list, axis=0)
                 
-                # 3. t-SNE
+                # --- 3. t-SNE & Plot ---
                 all_feats = np.concatenate([real_feats_np, fake_feats_np], axis=0)
-                # Reduce to 50 dims first with PCA for speed if dim is high, else direct t-SNE
+                
+                # Use PCA init for stability
                 tsne = TSNE(n_components=2, perplexity=min(30, len(all_feats)-1), init='pca', learning_rate='auto')
                 emb = tsne.fit_transform(all_feats)
                 
                 real_emb = emb[:len(real_feats_np)]
                 fake_emb = emb[len(real_feats_np):]
                 
-                # 4. Plot
                 plt.figure(figsize=(10, 8))
                 cmap = plt.get_cmap('tab10')
                 
                 for i, cls in enumerate(unique_cls):
                     # Plot Real
                     idx_real = gt_classes == cls
-                    plt.scatter(real_emb[idx_real, 0], real_emb[idx_real, 1], 
-                                color=cmap(i % 10), marker='o', alpha=0.6, label=f'Real {cls}')
+                    if idx_real.sum() > 0:
+                        plt.scatter(real_emb[idx_real, 0], real_emb[idx_real, 1], 
+                                    color=cmap(i % 10), marker='o', alpha=0.6, label=f'Real {cls}')
+                    
                     # Plot Fake
                     idx_fake = fake_labels_np == cls
-                    plt.scatter(fake_emb[idx_fake, 0], fake_emb[idx_fake, 1], 
-                                color=cmap(i % 10), marker='x', s=100, label=f'Fake {cls}')
+                    if idx_fake.sum() > 0:
+                        plt.scatter(fake_emb[idx_fake, 0], fake_emb[idx_fake, 1], 
+                                    color=cmap(i % 10), marker='x', s=100, label=f'Fake {cls}')
                                 
                 plt.legend()
                 plt.title(f"Feature Distribution Step {step}")
@@ -578,6 +652,9 @@ class GeneralizedRCNN(nn.Module):
                 print(f"--> Saved t-SNE visualization to {save_path}")
                 
         except Exception as e:
+            # Print full trace for debugging
+            import traceback
+            traceback.print_exc()
             print(f"--> Error in visualization: {e}")
 
     def inference(self, batched_inputs):
