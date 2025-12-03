@@ -447,6 +447,8 @@ class FastRCNNContrastOutputs(FastRCNNOutputs):
 
     def supervised_contrastive_loss(self):
         contrastive_loss = self.criterion(self.box_cls_feat_con, self.gt_classes, self.ious)
+        if contrastive_loss.dim() > 0:
+            contrastive_loss = contrastive_loss.mean()
         return contrastive_loss
 
     def losses(self):
