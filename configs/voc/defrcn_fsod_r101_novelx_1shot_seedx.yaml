@@ -12,11 +12,29 @@ MODEL:
     BACKWARD_SCALE: 0.0
     FREEZE: False
   ROI_HEADS:
+    NAME: "ContrastiveROIHeads"
+    NUM_CLASSES: 20
+    OUTPUT_LAYER: "CosineSimOutputLayers"
+    FREEZE_FEAT: False
+    BATCH_SIZE_PER_IMAGE: 256
+    IOU_THRESHOLDS: [0.4]
+
     ENABLE_DECOUPLE: True
     BACKWARD_SCALE: 0.001
     NUM_CLASSES: 5
     FREEZE_FEAT: True
     CLS_DROPOUT: True
+
+  ROI_BOX_HEAD:
+    CONTRASTIVE_BRANCH:
+      TEMPERATURE: 0.2
+      LOSS_WEIGHT: 0.2
+      DECAY:
+        ENABLED: True
+        STEPS: [3000, 6000]
+        RATE: 0.5
+      IOU_THRESHOLD: 0.6  # high credibility proposals provide consistency
+
 INPUT:
   MIN_SIZE_TRAIN: (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
   MIN_SIZE_TEST: 800
