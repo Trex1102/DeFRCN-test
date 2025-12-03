@@ -997,10 +997,78 @@ class NovelRoiHeads(StandardROIHeads):
             return pred_instances
 
 
+# @ROI_HEADS_REGISTRY.register()
+# class ContrastiveROIHeads(Res5ROIHeads):
+#     def __init__(self, cfg, input_shape):
+#         super().__init__(cfg, input_shape)
+#         # fmt: on
+#         self.fc_dim               = cfg.MODEL.ROI_BOX_HEAD.FC_DIM
+#         self.mlp_head_dim         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
+#         self.temperature          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
+#         self.contrast_loss_weight = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
+#         self.box_reg_weight       = cfg.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT
+#         self.weight_decay         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.ENABLED
+#         self.decay_steps          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS
+#         self.decay_rate           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE
+
+#         self.num_classes          = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+
+#         self.loss_version         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_VERSION
+#         self.contrast_iou_thres   = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.IOU_THRESHOLD
+#         self.reweight_func        = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.REWEIGHT_FUNC
+
+#         self.cl_head_only         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY
+#         # fmt: off
+
+#         self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
+#         if self.loss_version == 'V1':
+#             self.criterion = SupConLoss(self.temperature, self.contrast_iou_thres, self.reweight_func)
+#         elif self.loss_version == 'V2':
+#             self.criterion = SupConLossV2(self.temperature, self.contrast_iou_thres)
+#         self.criterion.num_classes = self.num_classes  # to be used in protype version
+
+#     def _forward_box(self, features, proposals):
+#         box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
+#         box_features = self.box_head(box_features)  # [None, FC_DIM]
+#         pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
+#         box_features_contrast = self.encoder(box_features)
+#         del box_features
+
+#         if self.weight_decay:
+#             storage = get_event_storage()
+#             if int(storage.iter) in self.decay_steps:
+#                 self.contrast_loss_weight *= self.decay_rate
+
+#         outputs = FastRCNNContrastOutputs(
+#             self.box2box_transform,
+#             pred_class_logits,
+#             pred_proposal_deltas,
+#             proposals,
+#             self.smooth_l1_beta,
+#             box_features_contrast,
+#             self.criterion,
+#             self.contrast_loss_weight,
+#             self.box_reg_weight,
+#             self.cl_head_only,
+#         )
+#         if self.training:
+#             return outputs.losses()
+#         else:
+#             pred_instances, _ = outputs.inference(
+#                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
+#             )
+#             return pred_instances
+
+
 @ROI_HEADS_REGISTRY.register()
 class ContrastiveROIHeads(Res5ROIHeads):
+    """
+    Res5ROIHeads with Contrastive Learning support.
+    Adapted for DeFRCN with ResNet-101 (C4 Backbone).
+    """
     def __init__(self, cfg, input_shape):
         super().__init__(cfg, input_shape)
+        
         # fmt: on
         self.fc_dim               = cfg.MODEL.ROI_BOX_HEAD.FC_DIM
         self.mlp_head_dim         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
@@ -1008,7 +1076,7 @@ class ContrastiveROIHeads(Res5ROIHeads):
         self.contrast_loss_weight = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
         self.box_reg_weight       = cfg.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT
         self.weight_decay         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.ENABLED
-        self.decay_steps          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS
+        self.decay_steps          = set(cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS)
         self.decay_rate           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE
 
         self.num_classes          = cfg.MODEL.ROI_HEADS.NUM_CLASSES
@@ -1016,22 +1084,52 @@ class ContrastiveROIHeads(Res5ROIHeads):
         self.loss_version         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_VERSION
         self.contrast_iou_thres   = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.IOU_THRESHOLD
         self.reweight_func        = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.REWEIGHT_FUNC
-
         self.cl_head_only         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY
         # fmt: off
 
-        self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
+        # --- CRITICAL FIX FOR RES5 BACKBONE ---
+        # ResNet101 Res5 block outputs 2048 channels. 
+        # input_shape.channels is usually 1024 (Res4). Res5 expands it.
+        # We try to detect the correct input dim for the encoder.
+        if hasattr(self, "res5"):
+             # If we can inspect the last layer of res5, great, otherwise assume expansion
+             # ResNet usually expands 1024 -> 2048 in the final stage
+             encoder_in_dim = 2048 
+        else:
+             encoder_in_dim = self.fc_dim
+
+        self.encoder = ContrastiveHead(encoder_in_dim, self.mlp_head_dim)
+        
         if self.loss_version == 'V1':
             self.criterion = SupConLoss(self.temperature, self.contrast_iou_thres, self.reweight_func)
         elif self.loss_version == 'V2':
             self.criterion = SupConLossV2(self.temperature, self.contrast_iou_thres)
-        self.criterion.num_classes = self.num_classes  # to be used in protype version
+        
+        if hasattr(self.criterion, "num_classes"):
+            self.criterion.num_classes = self.num_classes
 
     def _forward_box(self, features, proposals):
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        box_features = self.box_head(box_features)  # [None, FC_DIM]
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
-        box_features_contrast = self.encoder(box_features)
+        # 1. Proposal Boxes
+        proposal_boxes = [x.proposal_boxes for x in proposals]
+        
+        # 2. Shared ROI Transform (Pooler + Res5 Block)
+        # Res5ROIHeads uses this method. It pools features AND passes them through Res5.
+        # Output Shape: [Total_Proposals, 2048, 7, 7]
+        box_features = self._shared_roi_transform(features, proposal_boxes)
+        
+        # 3. Global Average Pooling
+        # We must flatten the 7x7 spatial features to get a vector for the heads.
+        # Output Shape: [Total_Proposals, 2048]
+        feature_pooled = box_features.mean(dim=[2, 3])
+
+        # 4. Box Predictor (Classification + Regression)
+        pred_class_logits, pred_proposal_deltas = self.box_predictor(feature_pooled)
+
+        # 5. Contrastive Encoding
+        # We pass the POOLED features to the encoder
+        box_features_contrast = self.encoder(feature_pooled)
+        
+        # Clean up spatial features to save memory
         del box_features
 
         if self.weight_decay:
@@ -1058,7 +1156,6 @@ class ContrastiveROIHeads(Res5ROIHeads):
                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
             )
             return pred_instances
-
 
 @ROI_HEADS_REGISTRY.register()
 class ContrastiveROIHeadsWithStorage(StandardROIHeads):
