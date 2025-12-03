@@ -116,7 +116,7 @@ class GeneralizedRCNN(nn.Module):
         # FIX: Dynamically unpack outputs to handle the case where ROIHeads returns 2 values (standard D2) 
         # instead of the expected 4 (custom version for t-SNE).
         if isinstance(roi_outputs, tuple) and len(roi_outputs) == 4:
-            # Case 1: Custom ROIHeads returns all 4 expected values
+            # Case 1: Custom ROIHeads returns all 4 expected values (for t-SNE feature collection)
             results, detector_losses, box_features, gt_classes = roi_outputs
         elif isinstance(roi_outputs, tuple) and len(roi_outputs) == 2:
             # Case 2: Standard D2 return in training mode: (losses_dict, results)
@@ -124,8 +124,10 @@ class GeneralizedRCNN(nn.Module):
             box_features = None
             gt_classes = None
         elif not isinstance(roi_outputs, tuple):
-            # Case 3: Standard D2 return in inference mode: returns a single object (Instances)
-            results = roi_outputs
+            # Case 3: Standard D2 return in inference mode: returns a single object (Instances).
+            # We wrap this single object in a list to correctly match the inference loop's expectation 
+            # of a list of results (one per image in the batch).
+            results = [roi_outputs]
             detector_losses = {} # Set to empty dict as in inference we have no losses
             box_features = None
             gt_classes = None
