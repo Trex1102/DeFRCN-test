@@ -1068,7 +1068,7 @@ class ContrastiveROIHeads(Res5ROIHeads):
     """
     def __init__(self, cfg, input_shape):
         
-        print(f"DEBUG: ContrastiveROIHeads (Res5) initialized. Classes: {self.num_classes}")
+        print(f"DEBUG: ContrastiveROIHeads (Res5) initialized.")
 
         super().__init__(cfg, input_shape)
         
