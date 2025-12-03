@@ -39,8 +39,8 @@ INPUT:
   MIN_SIZE_TEST: 800
 DATASETS:
   TRAIN: ("voc_2007_trainval_novelx_1shot_seedx", )
+  TEST: ()
   # TEST: ('voc_2007_test_novelx',)
-  TEST: ('voc_2007_test_novelx',)
 SOLVER:
   IMS_PER_BATCH: 8
   BASE_LR: 0.001
@@ -49,6 +49,8 @@ SOLVER:
   CHECKPOINT_PERIOD: 100000
   WARMUP_ITERS: 0
 TEST:
-  PCB_ENABLE: True
+  # PCB_ENABLE: True
+  PCB_ENABLE: False
   PCB_MODELPATH: "pretrained_weights/R-101.pkl"
+  EVAL_PERIOD: 0
 OUTPUT_DIR: "checkpoints/voc/defrcnn/defrcnn_novelx_1shot_seedx"
