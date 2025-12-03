@@ -105,9 +105,6 @@ def inference_on_dataset(model, data_loader, evaluator, cfg=None):
     # --- TSNE: Enable feature collection ---
     # We enable feature collection on the model instance.
     # We assume 'model' is an instance of GeneralizedRCNN which has 'collect_tsne_features' and 'tsne_feature_buffer'.
-    model.tsne_feature_buffer.clear() # Clear any old data
-    model.collect_tsne_features = True
-    logger.info("TSNE feature collection enabled.")
 
 
     logger.info("Start inference on {} images".format(len(data_loader)))
