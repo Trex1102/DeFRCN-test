@@ -1059,6 +1059,44 @@ class NovelRoiHeads(StandardROIHeads):
 #             )
 #             return pred_instances
 
+@ROI_HEADS_REGISTRY.register()
+class AttentiveROIHeads(Res5ROIHeads):
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+        
+        # 1. Identify input channels. For ResNet-101/50 C4, this is typically 2048.
+        # The 'res5' block output channels are defined in the backbone config.
+        out_channels = cfg.MODEL.RESNETS.RES5_OUT_CHANNELS # usually 2048
+        
+        # 2. OVERRIDE self.box_head
+        # In standard Res5ROIHeads, this is initialized as a heuristic GAP.
+        # We replace it entirely with our learnable module.
+        self.box_head = AttentiveGlobalPooling(out_channels)
+
+    def _forward_box(self, features, proposals):
+        # We override this to ensure explicit control, though simpler overrides might work.
+        # This logic follows the standard Detectron2 Res5ROIHeads flow but clarifies the steps.
+
+        # 1. Get the feature map corresponding to the specific level (usually 'res4')
+        features = [features[f] for f in self.box_in_features]
+        
+        # 2. RoI Pooling/Align -> Output: (N, 1024, 14, 14) usually
+        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
+        
+        # 3. Apply the Heavy Res5 Stage -> Output: (N, 2048, 7, 7)
+        # This applies the conv layers (conv5_1, conv5_2, etc.) per ROI
+        box_features = self.res5(box_features)
+        
+        # 4. APPLY ATTENTIVE POOLING (Replaces Global Avg Pool)
+        # Output: (N, 2048)
+        feature_vector = self.box_head(box_features)
+        
+        # 5. Prediction (Class Scores + Box Deltas)
+        predictions = self.box_predictor(feature_vector)
+        
+        del box_features # save memory
+        return predictions, [] # empty list is for "losses" if handled here, but usually handled by calling code
+
 
 @ROI_HEADS_REGISTRY.register()
 class ContrastiveROIHeads(Res5ROIHeads):
