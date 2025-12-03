@@ -1059,6 +1059,72 @@ class NovelRoiHeads(StandardROIHeads):
 #             )
 #             return pred_instances
 
+
+
+@ROI_HEADS_REGISTRY.register()
+class HallucinatingROIHeads(Res5ROIHeads):
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+        # Initialize the Hallucinator
+        self.hallucinator = FeatureHallucinator(channels=2048)
+        
+        # Hyperparameter for reconstruction loss weight
+        self.lambda_recon = 0.5 
+
+    def _forward_box(self, features, proposals):
+        # 1. Standard RoI Pooling & Res5
+        features = [features[f] for f in self.box_in_features]
+        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
+        box_features = self.res5(box_features) # Shape: (N, 2048, 7, 7)
+
+        if self.training:
+            # --- TRAINING PHASE: LEARN TO IMAGINE ---
+            
+            # A. Create "Ground Truth" (The clean features)
+            # We assume the training proposals (mostly) contain the object.
+            target_features = box_features.detach() # Stop gradients to backbone for target
+
+            # B. Create "Synthetic Occlusion" (The input)
+            # Generate a random binary mask (Batch, 1, 7, 7)
+            # Probability 0.3 to drop a pixel (simulate occlusion)
+            mask = torch.rand((box_features.size(0), 1, 7, 7), device=box_features.device) > 0.3
+            corrupted_features = box_features * mask.float()
+
+            # C. Hallucinate
+            repaired_features = self.hallucinator(corrupted_features)
+
+            # D. Reconstruction Loss (MSE)
+            # Force repaired features to look like the original clean features
+            loss_recon = F.mse_loss(repaired_features, target_features)
+
+            # E. Use Repaired Features for Classification
+            # This ensures the Classifier learns to use the "imagined" parts
+            final_features = self.box_head(repaired_features) # pooling
+            predictions = self.box_predictor(final_features)
+            
+            # Add recon loss to the return dictionary (handled by Detectron2)
+            losses = predictions[1] # standard losses
+            # We need to hackily inject this loss. 
+            # In Detectron2, you usually return a dict of losses.
+            # Here, we might need to modify the calling function or add it to a tracking dict.
+            # Ideally:
+            losses["loss_hallucination"] = loss_recon * self.lambda_recon
+            
+            return predictions, losses
+
+        else:
+            # --- INFERENCE PHASE: USE IMAGINATION ---
+            # We don't artificially mask here. The input is NATURALLY occluded (the sofa).
+            # The Hallucinator will see zeros/noise in the occluded area and "fix" it
+            # based on what it learned during training.
+            
+            repaired_features = self.hallucinator(box_features)
+            final_features = self.box_head(repaired_features)
+            predictions = self.box_predictor(final_features)
+            return predictions, {}
+
+
+
 @ROI_HEADS_REGISTRY.register()
 class AttentiveROIHeads(Res5ROIHeads):
     def __init__(self, cfg, input_shape):
