@@ -108,13 +108,32 @@ class GeneralizedRCNN(nn.Module):
             scale = self.cfg.MODEL.ROI_HEADS.BACKWARD_SCALE
             features_de_rcnn = {k: self.affine_rcnn(decouple_layer(features[k], scale)) for k in features}
 
-        # NOTE: The 'return_features' keyword argument was removed here to fix the TypeError,
-        # as it was not accepted by the ROIHeads implementation.
-        # We assume that the ROIHeads is now configured to return the raw box features 
-        # (box_features) and corresponding labels (gt_classes) when called in this context.
-        results, detector_losses, box_features, gt_classes = self.roi_heads(
+        # Call ROI Heads
+        roi_outputs = self.roi_heads(
             images, features_de_rcnn, proposals, gt_instances
         )
+
+        # FIX: Dynamically unpack outputs to handle the case where ROIHeads returns 2 values (standard D2) 
+        # instead of the expected 4 (custom version for t-SNE).
+        if isinstance(roi_outputs, tuple) and len(roi_outputs) == 4:
+            # Case 1: Custom ROIHeads returns all 4 expected values
+            results, detector_losses, box_features, gt_classes = roi_outputs
+        elif isinstance(roi_outputs, tuple) and len(roi_outputs) == 2:
+            # Case 2: Standard D2 return in training mode: (losses_dict, results)
+            detector_losses, results = roi_outputs
+            box_features = None
+            gt_classes = None
+        elif not isinstance(roi_outputs, tuple):
+            # Case 3: Standard D2 return in inference mode: returns a single object (Instances)
+            results = roi_outputs
+            detector_losses = {} # Set to empty dict as in inference we have no losses
+            box_features = None
+            gt_classes = None
+        else:
+            # Fallback for unexpected number of outputs
+            raise ValueError(
+                f"Unexpected number of outputs from self.roi_heads: got {len(roi_outputs)} values."
+            )
 
         # Return 6 values for compatibility with forward/inference
         return proposal_losses, detector_losses, results, box_features, gt_classes, images.image_sizes
