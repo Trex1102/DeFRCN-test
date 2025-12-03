@@ -108,12 +108,12 @@ class GeneralizedRCNN(nn.Module):
             scale = self.cfg.MODEL.ROI_HEADS.BACKWARD_SCALE
             features_de_rcnn = {k: self.affine_rcnn(decouple_layer(features[k], scale)) for k in features}
 
-        # NOTE: We assume that the ROIHeads is modified or wrapped to optionally 
-        # return the raw box features (pooled/processed features before the final classifier) 
-        # and the corresponding labels (gt_classes) for features.
+        # NOTE: The 'return_features' keyword argument was removed here to fix the TypeError,
+        # as it was not accepted by the ROIHeads implementation.
+        # We assume that the ROIHeads is now configured to return the raw box features 
+        # (box_features) and corresponding labels (gt_classes) when called in this context.
         results, detector_losses, box_features, gt_classes = self.roi_heads(
-            images, features_de_rcnn, proposals, gt_instances, 
-            return_features=self.collect_tsne_features # Pass the flag down
+            images, features_de_rcnn, proposals, gt_instances
         )
 
         # Return 6 values for compatibility with forward/inference
@@ -213,9 +213,6 @@ class GeneralizedRCNN(nn.Module):
         pixel_std = (torch.Tensor(
             self.cfg.MODEL.PIXEL_STD).to(self.device).view(num_channels, 1, 1))
         return lambda x: (x - pixel_mean) / pixel_std
-
-
-
 
 
 # import torch
