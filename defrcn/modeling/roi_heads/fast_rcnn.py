@@ -450,6 +450,9 @@ class FastRCNNContrastOutputs(FastRCNNOutputs):
         return contrastive_loss
 
     def losses(self):
+        
+        print(f"DEBUG: Calculating losses. Weight: {self.contrast_loss_weight}")
+
         if self.cl_head_only:
             return {'loss_contrast': self.supervised_contrastive_loss()}
         else:
