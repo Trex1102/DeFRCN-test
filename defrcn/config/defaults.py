@@ -24,6 +24,9 @@ _CC.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION = 7  # for faster
 _CC.MODEL.ROI_HEADS.NUM_CLASSES = 20
 
 
+
+
+
 # ------------- TEST ------------- #
 _CC.TEST.PCB_ENABLE = False
 _CC.TEST.PCB_MODELTYPE = 'resnet'             # res-like
@@ -39,19 +42,19 @@ _CC.MUTE_HEADER = True
 
 _CC.MODEL.ROI_BOX_HEAD = CN()
 
-_CC.MODEL.ROI_BOX_HEAD.NAME = ""
+_CC.MODEL.ROI_BOX_HEAD.NAME = "FastRCNNConvFCHead"
 # Default weights on (dx, dy, dw, dh) for normalizing bbox regression targets
 # These are empirically chosen to approximately lead to unit variance targets
 _CC.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS = (10.0, 10.0, 5.0, 5.0)
 # The transition point from L1 to L2 loss. Set to 0.0 to make the loss simply L1.
 _CC.MODEL.ROI_BOX_HEAD.SMOOTH_L1_BETA = 0.0
-_CC.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION = 14
+_CC.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION = 7
 # set sampling ratio to 0 to sample densely
 _CC.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO = 0
 # Type of pooling operation applied to the incoming feature map for each RoI
 _CC.MODEL.ROI_BOX_HEAD.POOLER_TYPE = "ROIAlignV2"
 
-_CC.MODEL.ROI_BOX_HEAD.NUM_FC = 0
+_CC.MODEL.ROI_BOX_HEAD.NUM_FC = 2
 # Hidden layer dimension for FC layers in the RoI box head
 _CC.MODEL.ROI_BOX_HEAD.FC_DIM = 1024
 _CC.MODEL.ROI_BOX_HEAD.NUM_CONV = 0
@@ -81,3 +84,6 @@ _CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE = 0.2
 _CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.IOU_THRESHOLD = 0.5
 _CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_VERSION = 'V1'
 _CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.REWEIGHT_FUNC = 'none'
+
+# train the contrastive head only
+_C.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY = False

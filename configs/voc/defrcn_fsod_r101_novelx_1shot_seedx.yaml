@@ -14,7 +14,7 @@ MODEL:
   ROI_HEADS:
     NAME: "ContrastiveROIHeads"
     NUM_CLASSES: 20
-    OUTPUT_LAYER: "CosineSimOutputLayers"
+    # OUTPUT_LAYER: "CosineSimOutputLayers"
     FREEZE_FEAT: False
     BATCH_SIZE_PER_IMAGE: 256
     IOU_THRESHOLDS: [0.4]

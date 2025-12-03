@@ -26,9 +26,11 @@ from .fast_rcnn import (
     ContrastOutputsWithStorage,
     ROI_HEADS_OUTPUT_REGISTRY,
 )
-from .utils import concat_all_gathered, select_all_gather, cat
 
-from .contrastive_loss import (
+
+from ..utils import concat_all_gathered, select_all_gather, cat
+
+from ..contrastive_loss import (
     SupConLoss,
     SupConLossV2,
     ContrastiveHead,
@@ -996,7 +998,7 @@ class NovelRoiHeads(StandardROIHeads):
 
 
 @ROI_HEADS_REGISTRY.register()
-class ContrastiveROIHeads(StandardROIHeads):
+class ContrastiveROIHeads(Res5ROIHeads):
     def __init__(self, cfg, input_shape):
         super().__init__(cfg, input_shape)
         # fmt: on
