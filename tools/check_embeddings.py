@@ -9,8 +9,6 @@ loaded_prototypes = np.load(CLIP_PATH)
 loaded_prototypes = torch.from_numpy(loaded_prototypes).to(device).float()
 
 # 2. Define the ACTUAL class names your detector expects
-# These must be in the order Detectron2 sees them (0, 1, 2...)
-# Example for VOC Split 1 (check your dataset config!):
 class_names = ["aeroplane", "bicycle", "boat", "bottle", "car",
         "cat", "chair", "diningtable", "dog", "horse",
         "person", "pottedplant", "sheep", "train", "tvmonitor",
@@ -23,6 +21,7 @@ model, preprocess = clip.load("ViT-B/32", device=device)
 text_inputs = torch.cat([clip.tokenize(f"a photo of a {c}") for c in class_names]).to(device)
 with torch.no_grad():
     text_features = model.encode_text(text_inputs)
+    text_features = text_features.float()
     text_features /= text_features.norm(dim=-1, keepdim=True)
     
     # Normalize your loaded prototypes too
