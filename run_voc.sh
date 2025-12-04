@@ -25,14 +25,14 @@ BASE_WEIGHT=${SAVE_DIR}/defrcn_det_r101_base${SPLIT_ID}/model_reset_remove.pth
 for repeat_id in 0
 do
     # for shot in 1 2 3 5 10   # if final, 10 -> 1 2 3 5 10
-    for shot in 1   # if final, 10 -> 1 2 3 5 10
+    for shot in 3   # if final, 10 -> 1 2 3 5 10
     do
         for seed in 0
         do
             python3 tools/create_config.py --dataset voc --config_root configs/voc \
                 --shot ${shot} --seed ${seed} --setting 'fsod' --split ${SPLIT_ID}
             CONFIG_PATH=configs/voc/defrcn_fsod_r101_novel${SPLIT_ID}_${shot}shot_seed${seed}.yaml
-            OUTPUT_DIR=${SAVE_DIR}/defrcn_fsod_r101_novel${SPLIT_ID}/fsrw-like-with-CL/${shot}shot_seed${seed}_repeat${repeat_id}
+            OUTPUT_DIR=${SAVE_DIR}/defrcn_fsod_r101_novel${SPLIT_ID}/fsrw-like-with-attention/${shot}shot_seed${seed}_repeat${repeat_id}
             python3 main.py --config-file ${CONFIG_PATH}                       \
                 --opts MODEL.WEIGHTS ${BASE_WEIGHT} OUTPUT_DIR ${OUTPUT_DIR}                   \
                        TEST.PCB_MODELPATH ${IMAGENET_PRETRAIN_TORCH} 

@@ -27,6 +27,8 @@ from .fast_rcnn import (
     ROI_HEADS_OUTPUT_REGISTRY,
 )
 
+from ..attentive_pooling import AttentiveGlobalPooling
+from ..hallucinator import FeatureHallucinator
 
 from ..utils import concat_all_gathered, select_all_gather, cat
 
@@ -1132,7 +1134,7 @@ class AttentiveROIHeads(Res5ROIHeads):
         
         # 1. Identify input channels. For ResNet-101/50 C4, this is typically 2048.
         # The 'res5' block output channels are defined in the backbone config.
-        out_channels = cfg.MODEL.RESNETS.RES5_OUT_CHANNELS # usually 2048
+        out_channels = 2048 # usually 2048
         
         # 2. OVERRIDE self.box_head
         # In standard Res5ROIHeads, this is initialized as a heuristic GAP.
