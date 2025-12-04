@@ -1167,6 +1167,103 @@ class AttentiveROIHeads(Res5ROIHeads):
 
 
 @ROI_HEADS_REGISTRY.register()
+class HallucinatingAttentiveROIHeads(Res5ROIHeads):
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+
+        # ---------------------------------------------------------
+        # 1. Hallucination Components
+        # ---------------------------------------------------------
+        # Typically Res5 output is 2048 channels
+        self.hallucinator = FeatureHallucinator(channels=2048)
+        self.lambda_recon = 0.5 
+        self.dropout_rate = 0.3 # Probability to drop pixels during training
+
+        # ---------------------------------------------------------
+        # 2. Attention Components (Overrides default box_head)
+        # ---------------------------------------------------------
+        # We replace the standard Global Average Pooling (GAP) 
+        # with the Attentive Pooling module.
+        self.box_head = AttentiveGlobalPooling(out_channels=2048)
+
+    def forward(self, images, features, proposals, targets=None):
+        """
+        We must override the main forward to handle the auxiliary 
+        hallucination loss returned by _forward_box.
+        """
+        del images  # Unused
+        
+        # 1. Label and sample proposals (Standard Detectron2 logic)
+        if self.training:
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        del targets
+
+        # 2. Shared Subnet (Res5) + Hallucination + Attention
+        # Note: We modified _forward_box to return (predictions, aux_losses)
+        predictions, aux_losses = self._forward_box(features, proposals)
+
+        if self.training:
+            del features
+            # 3. Calculate Class/Box Losses (Standard)
+            losses = self.box_predictor.losses(predictions, proposals)
+            
+            # 4. Add Hallucination Loss
+            losses.update(aux_losses)
+            return proposals, losses
+        else:
+            # Inference
+            pred_instances, _ = self.box_predictor.inference(predictions, proposals)
+            return pred_instances, {}
+
+    def _forward_box(self, features, proposals):
+        # 1. Fetch Features
+        features = [features[f] for f in self.box_in_features]
+        
+        # 2. RoI Pooling (Standard)
+        # Output: (N, 2048, 14, 14) or similar depending on stride
+        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
+        
+        # 3. Res5 Stage (Standard)
+        # Output: (N, 2048, 7, 7)
+        box_features = self.res5(box_features)
+
+        aux_losses = {}
+
+        if self.training:
+            # --- TRAINING: LEARN TO IMAGINE ---
+            
+            # A. Create "Ground Truth" (Clean features)
+            target_features = box_features.detach()
+
+            # B. Create "Synthetic Occlusion"
+            # Random binary mask (Batch, 1, 7, 7)
+            mask = torch.rand((box_features.size(0), 1, 7, 7), device=box_features.device) > self.dropout_rate
+            corrupted_features = box_features * mask.float()
+
+            # C. Hallucinate (Repair the features)
+            repaired_features = self.hallucinator(corrupted_features)
+
+            # D. Reconstruction Loss
+            loss_recon = F.mse_loss(repaired_features, target_features)
+            aux_losses["loss_hallucination"] = loss_recon * self.lambda_recon
+
+        else:
+            # --- INFERENCE: USE IMAGINATION ---
+            # Input is naturally occluded; just repair it.
+            repaired_features = self.hallucinator(box_features)
+
+        # 4. ATTENTIVE POOLING
+        # Instead of GAP, we use the Attentive Head on the *repaired* features.
+        # Input: (N, 2048, 7, 7) -> Output: (N, 2048)
+        feature_vector = self.box_head(repaired_features)
+
+        # 5. Prediction
+        predictions = self.box_predictor(feature_vector)
+
+        return predictions, aux_losses
+
+
+@ROI_HEADS_REGISTRY.register()
 class ContrastiveROIHeads(Res5ROIHeads):
     """
     Res5ROIHeads with Contrastive Learning support.
