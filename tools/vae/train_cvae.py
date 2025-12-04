@@ -4,7 +4,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
-from .CondResidualVAE import CondResidualVAE
+from .cond_residual_vae import CondResidualVAE
 from .vae_loss import vae_loss_function
 
 # ==========================================
