@@ -18,14 +18,7 @@ class ResidualDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.residuals[idx]
-
-# ============================================================
-#  VAE Architecture
-#  — NO normalization layers
-#  — Fully-connected MLP
-#  — Residual dim = 2048
-#  — Latent dim = 256 (can be adjusted)
-# ============================================================
+    
 
 class ResidualVAE(nn.Module):
     def __init__(self, dim=2048, latent_dim=256):
