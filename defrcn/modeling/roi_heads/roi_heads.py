@@ -28,9 +28,9 @@ from .fast_rcnn import (
 )
 
 from ..attentive_pooling import AttentiveGlobalPooling
-from ..hallucinator import FeatureHallucinator
-
-from ..utils import concat_all_gathered, select_all_gather, cat
+from ..feature_hallucinator import FeatureHallucinationModule
+from ..sem_visual_align import SemanticVisualAlignment
+from ..utils import concat_all_gathered, select_all_gather, cat, apply_random_block_mask , sample_indices
 
 from ..contrastive_loss import (
     SupConLoss,
@@ -486,1130 +486,175 @@ class StandardROIHeads(ROIHeads):
             )
             return pred_instances
 
-
 @ROI_HEADS_REGISTRY.register()
-class MoCoROIHeadsV1(StandardROIHeads):
+class Res5ROIHeadsNSHEfficient(Res5ROIHeads):
     """
-    MoCo queue encoder is the roi box head only.
+    Extends the official Res5ROIHeads by adding:
+      - AttentiveGlobalPooling (AGP)
+      - FeatureHallucinationModule (FHM)
+      - SemanticVisualAlignment (SVA)
+    Efficiency knobs in cfg.MODEL.NSH:
+      - ENABLED (bool)
+      - FHM_SAMPLE_RATIO (float)
+      - FHM_MAX_SAMPLES (int)
+      - FHM_SPATIAL_RED (int)
+      - FHM_HIDDEN (int)
+      - LAMBDA_REC, LAMBDA_SVA, LAMBDA_SP
+      - FHM_TRAIN (bool) (True for base training, False for novel fine-tuning)
+      - CLASS_NAMES, CLIP_MODEL, CLIP_TAU (optional for automatic CLIP text embedding load)
     """
+
     def __init__(self, cfg, input_shape):
+        # initialize base res5 ROI head (sets pooler, res5, box_predictor)
         super().__init__(cfg, input_shape)
-        # fmt: on
-        self.momentum                  = cfg.MODEL.MOCO.MOMENTUM
-        self.queue_size                = cfg.MODEL.MOCO.QUEUE_SIZE
-        self.tao                       = cfg.MODEL.MOCO.TEMPERATURE
-        self.mlp_dims                  = cfg.MODEL.MOCO.MLP_DIMS
-        self.warmup_steps              = cfg.MODEL.MOCO.WARM_UP_STEPS
-        self.cls_loss_weight           = cfg.MODEL.MOCO.CLS_LOSS_WEIGHT
-        self.save_queue_iters          = cfg.MODEL.MOCO.SAVE_QUEUE_ITERS
 
-        self.debug_deque_and_enque     = cfg.MODEL.MOCO.DEBUG_DEQUE_AND_ENQUE
-        # fmt: off
+        # NSH config
+        ns_cfg = getattr(cfg.MODEL, "NSH", {}) or {}
+        self.nsh_enabled = bool(ns_cfg.get("ENABLED", True))
 
-        self._init_box_head(cfg)
+        if not self.nsh_enabled:
+            return
 
-    def _init_box_head(self, cfg):
-        # fmt: off
-        pooler_resolution = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
-        pooler_scales     = tuple(1.0 / self.feature_strides[k] for k in self.in_features)
-        sampling_ratio    = cfg.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO
-        pooler_type       = cfg.MODEL.ROI_BOX_HEAD.POOLER_TYPE
-        # fmt: on
+        # Efficiency knobs
+        self.fhm_sample_ratio = float(ns_cfg.get("FHM_SAMPLE_RATIO", 0.25))
+        self.fhm_max_samples = int(ns_cfg.get("FHM_MAX_SAMPLES", 128))
+        self.fhm_spatial_red = int(ns_cfg.get("FHM_SPATIAL_RED", 1))
+        self.fhm_train = bool(ns_cfg.get("FHM_TRAIN", True))  # True for base training, False for novel
 
-        # If StandardROIHeads is applied on multiple feature maps (as in FPN),
-        # then we share the same predictors and therefore the channel counts must be the same
-        in_channels = [self.feature_channels[f] for f in self.in_features]
-        # Check all channel counts are equal
-        assert len(set(in_channels)) == 1, in_channels
-        in_channels = in_channels[0]
+        # loss weights
+        self.lambda_rec = float(ns_cfg.get("LAMBDA_REC", 1.0))
+        self.lambda_sva = float(ns_cfg.get("LAMBDA_SVA", 0.1))
+        self.lambda_sp = float(ns_cfg.get("LAMBDA_SP", 0.01))
 
-        self.box_pooler = ROIPooler(
-            output_size=pooler_resolution,
-            scales=pooler_scales,
-            sampling_ratio=sampling_ratio,
-            pooler_type=pooler_type,
-        )
-        # Here we split "box head" and "box predictor", which is mainly due to historical reasons.
-        # They are used together so the "box predictor" layers should be part of the "box head".
-        # New subclasses of ROIHeads do not need "box predictor"s.
-        self.box_head_q = build_box_head(
-            cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
-        )
-        self.box_head_k = build_box_head(
-            cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
-        )
-        self.output_layer_name = cfg.MODEL.ROI_HEADS.OUTPUT_LAYER
-        self.box_predictor = ROI_HEADS_OUTPUT_REGISTRY.get(self.output_layer_name)(
-            cfg, self.box_head_q.output_size, self.num_classes, self.cls_agnostic_bbox_reg
-        )
+        # reuse out_channels set by parent (Res5ROIHeads)
+        out_ch = getattr(self, "out_channels", None)
+        if out_ch is None:
+            # fallback (shouldn't happen if parent built res5)
+            out_ch = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS * (2 ** 3)
+            self.out_channels = out_ch
 
-    def _moco_encoder_init(self, cfg, *args):
-        # ROI Box Head
-        for param_q, param_k in zip(self.box_head_q.parameters(),
-                                    self.box_head_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
+        # NSH modules
+        hidden = int(ns_cfg.get("FHM_HIDDEN", max(64, out_ch // 4)))
+        self.agp = AttentiveGlobalPooling(out_ch)
+        self.fhm = FeatureHallucinationModule(out_ch, hidden_channels=hidden)
+        clip_dim = int(ns_cfg.get("CLIP_DIM", 512))
+        self.sva = SemanticVisualAlignment(in_dim=out_ch, clip_dim=clip_dim, hidden=1024, tau=float(ns_cfg.get("CLIP_TAU", 0.07)))
 
-        # MLP head
-        self.mlp_q = nn.Sequential(
-            nn.Linear(1024, self.mlp_dims[0]),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, self.mlp_dims[1]),
-        )
-        for layer in self.mlp_q:
-            if isinstance(layer, nn.Linear):
-                weight_init.c2_xavier_fill(layer)
-        self.mlp_k = nn.Sequential(
-            nn.Linear(1024, self.mlp_dims[0]),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, self.mlp_dims[1]),
-        )
-        for param_q, param_k in zip(self.mlp_q.parameters(),
-                                    self.mlp_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
-
-        # MoCo queue
-        self.register_buffer('queue', torch.randn(self.mlp_dims[1], self.queue_size))
-        self.register_buffer('queue_label', torch.empty(self.queue_size).fill_(-1).long())
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        self.register_buffer('cycles', torch.zeros(1))
-
-    @torch.no_grad()
-    def _momentum_update(self):
-        for param_q, param_k in zip(self.box_head_q.parameters(),
-                                    self.box_head_k.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1 - self.momentum)
-
-        for param_q, param_k in zip(self.mlp_q.parameters(),
-                                    self.mlp_k.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1 - self.momentum)
-
-
-    def _forward_box(self, features, proposals):
-        '''Args:
-            proposals: 256 * 2 random sampled proposals w/ positive fraction
-            features: List of L features
-        '''
-        q_box_features = self.box_pooler(features, [p.proposal_boxes for p in proposals]) # [None, 256, 7, 7]
-        q_box_features = self.box_head_q(q_box_features) # [None, 1024]
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(q_box_features)
-
-        outputs = FastRCNNOutputs(
-            self.box2box_transform,
-            pred_class_logits,
-            pred_proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-        )
-
-        if not self.training:
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
-
-        # compute query features
-        q_embedding = self.mlp_q(q_box_features)
-        q = F.normalize(q_embedding)
-        del q_box_features
-
-        # compute key features
-        with torch.no_grad():  # no gradient to keys
-            self._momentum_update() # update key encoder
-            k_box_features = self.box_pooler(features, [p.proposal_boxes for p in proposals])
-            k_box_features = self.box_head_k(k_box_features)
-            k_embedding = self.mlp_k(k_box_features)
-            k = F.normalize(k_embedding)
-            del k_box_features
-
-        _ = self._dequeue_and_enqueue(k, proposals)
-        # q.shape = [None, 128], self.queue.shape = [128, S]
-        moco_logits = torch.mm(q, self.queue.clone().detach()) # [None, queue size(S)]
-        moco_logits /= self.tao
-
-        storage = get_event_storage()
-        self.moco_loss_weight = min(storage.iter / self.warmup_steps, 1.0)
-        if self.save_queue_iters and (storage.iter % self.save_queue_iters == 0):
-            save_as = '/data/tmp/queue_{}.pth'.format(storage.iter)
-            print('save moco queue to ', save_as)
-            torch.save(self.queue, save_as)
-
-        outputs = FastRCNNMoCoOutputs(
-            self.box2box_transform,
-            pred_class_logits,
-            pred_proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-            moco_logits,       # [None, S]
-            self.queue_label,  # [1, None]
-            self.moco_loss_weight,
-            self.cls_loss_weight,
-        )
-        return outputs.losses()
-
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, key, proposals):
-        label = torch.cat([p.gt_classes for p in proposals], dim=0)
-        if self.debug_deque_and_enque:
-            keys = key
-            labels = label
-        else:
-            keys = concat_all_gathered(key)
-            labels = concat_all_gathered(label)
-
-        # 确认能通过
-        # assert keys.shape[0] == labels.shape[0]
-        # assert self.queue.shape[1] == self.queue_size
-
-        batch_size = keys.shape[0]
-        if self.queue_size % batch_size != 0:
-            print()
-            print(self.queue_ptr, self.cycles, batch_size, self.queue.shape)
-            print()
-
-        ptr = int(self.queue_ptr)
-        cycles = int(self.cycles)
-        if ptr + batch_size <= self.queue.shape[1]:
-            self.queue[:, ptr:ptr + batch_size] = keys.T
-            self.queue_label[ptr:ptr + batch_size] = labels
-        else:
-            rem = self.queue.shape[1] - ptr
-            self.queue[:, ptr:ptr + rem] = keys[:rem, :].T
-            self.queue_label[ptr:ptr + rem] = labels[:rem]
-
-        ptr += batch_size
-        if ptr >= self.queue.shape[1]:
-            ptr = 0
-            cycles += 1
-        self.cycles[0] = cycles
-        self.queue_ptr[0] = ptr
-        return cycles
-
-
-@ROI_HEADS_REGISTRY.register()
-class MoCoROIHeadsV3(MoCoROIHeadsV1):
-    """
-    MoCo v2: contrastive encoder is composed of backbone and roi
-    """
-    def _moco_encoder_init(self, cfg, *args):
-        # ResNet-FPN backbone
-        self.backbone_q, = args
-        self.backbone_k = build_backbone(cfg)
-        for param_q, param_k in zip(self.backbone_q.parameters(),
-                                    self.backbone_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
-
-        # ROI Box Head
-        for param_q, param_k in zip(self.box_head_q.parameters(),
-                                    self.box_head_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
-
-        # MLP head
-        self.mlp_q = nn.Sequential(
-            nn.Linear(1024, self.mlp_dims[0]),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, self.mlp_dims[1]),
-        )
-        for layer in self.mlp_q:
-            if isinstance(layer, nn.Linear):
-                weight_init.c2_xavier_fill(layer)
-        self.mlp_k = nn.Sequential(
-            nn.Linear(1024, self.mlp_dims[0]),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, self.mlp_dims[1]),
-        )
-        for param_q, param_k in zip(self.mlp_q.parameters(),
-                                    self.mlp_k.parameters()):
-            param_k.data.copy_(param_q.data)
-            param_k.requires_grad = False
-
-        # MoCo queue
-        self.register_buffer('queue', torch.randn(self.mlp_dims[1], self.queue_size))
-        self.register_buffer('queue_label', torch.empty(self.queue_size).fill_(-1).long())
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        self.register_buffer('cycles', torch.zeros(1))
-
-    @torch.no_grad()
-    def _momentum_update(self):
-        for param_q, param_k in zip(self.backbone_q.parameters(),
-                                    self.backbone_k.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1 - self.momentum)
-
-        for param_q, param_k in zip(self.box_head_q.parameters(),
-                                    self.box_head_k.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1 - self.momentum)
-
-        for param_q, param_k in zip(self.mlp_q.parameters(),
-                                    self.mlp_k.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1 - self.momentum)
+        # lazy text embeddings buffer: try to auto-load text embeddings if class names provided
+        class_names = ns_cfg.get("CLASS_NAMES", None)
+        if class_names:
+            # try to load CLIP locally (optional); if fails, user should set sva.text_embeddings externally
+            try:
+                import clip
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                clip_model_name = ns_cfg.get("CLIP_MODEL", "ViT-B/32")
+                clip_model, _ = clip.load(clip_model_name, device=device, jit=False)
+                clip_model.eval()
+                with torch.no_grad():
+                    prompts = [f"a photo of a {c}" for c in class_names]
+                    tokens = clip.tokenize(prompts).to(device)
+                    t_emb = clip_model.encode_text(tokens).float()
+                    t_emb = F.normalize(t_emb, dim=1)
+                    # store on CPU initially to avoid GPU memory until training
+                    self.sva.text_embeddings = t_emb.cpu()
+            except Exception as e:
+                # do not raise; user can set text embeddings later via `self.sva.text_embeddings = tensor`
+                print("Warning: automatic CLIP load for SVA failed. Set SVA text embeddings manually.", e)
 
     def forward(self, images, features, proposals, targets=None):
+        # reuse parent's proposal labeling & sampling
+        del images
         if self.training:
             proposals = self.label_and_sample_proposals(proposals, targets)
         del targets
 
-        features_list = [features[f] for f in self.in_features]
-        if self.training:
-            losses = self._forward_box(images, features_list, proposals)
-            return proposals, losses  # return to rcnn.py line 201
-        else:
-            pred_instances = self._forward_box(images, features_list, proposals)
-            return pred_instances, {}
+        proposal_boxes = [x.proposal_boxes for x in proposals]
+        # _shared_roi_transform is inherited from Res5ROIHeads and already does pooler+res5
+        box_features = self._shared_roi_transform([features[f] for f in self.in_features], proposal_boxes)
+        # box_features: (R, C, H, W)
 
-    def _forward_box(self, images, features, proposals):
-        '''Args:
-            proposals: 256 * 2 random sampled proposals w/ positive fraction
-            features: List of L features
-        '''
-        q_box_features = self.box_pooler(features, [p.proposal_boxes for p in proposals]) # [None, 256, 7, 7]
-        q_box_features = self.box_head_q(q_box_features) # [None, 1024]
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(q_box_features)
-
-        outputs = FastRCNNOutputs(
-            self.box2box_transform,
-            pred_class_logits,
-            pred_proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-        )
-
-        if not self.training:
-            del images
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
-
-        # compute query features
-        q_embedding = self.mlp_q(q_box_features)
-        q = F.normalize(q_embedding)
-        del q_box_features
-
-        # compute key features
-        with torch.no_grad():  # no gradient to keys
-            self._momentum_update() # update key encoder
-            k_features = self.backbone_k(images.tensor)
-            k_features = [k_features[fpn_lvl] for fpn_lvl in self.in_features]
-            del images
-            k_box_features = self.box_pooler(k_features, [p.proposal_boxes for p in proposals])
-            del k_features
-            k_box_features = self.box_head_k(k_box_features)
-            k_embedding = self.mlp_k(k_box_features)
-            k = F.normalize(k_embedding)
-            del k_box_features
-
-        _ = self._dequeue_and_enqueue(k, proposals)
-        # q.shape = [None, 128], self.queue.shape = [128, S]
-        moco_logits = torch.mm(q, self.queue.clone().detach()) # [None, queue size(S)]
-        moco_logits /= self.tao
-
-        storage = get_event_storage()
-        self.moco_loss_weight = min(storage.iter / self.warmup_steps, 1.0)
-        if self.save_queue_iters and (storage.iter % self.save_queue_iters == 0):
-            save_as = '/data/tmp/queue_{}.pth'.format(storage.iter)
-            print('save moco queue to ', save_as)
-            torch.save(self.queue, save_as)
-
-        outputs = FastRCNNMoCoOutputs(
-            self.box2box_transform,
-            pred_class_logits,
-            pred_proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-            moco_logits,       # [None, S]
-            self.queue_label,  # [1, None]
-            self.moco_loss_weight,
-            self.cls_loss_weight,
-        )
-        return outputs.losses()
-
-
-@ROI_HEADS_REGISTRY.register()
-class DoubleHeadROIHeads(StandardROIHeads):
-    """
-    Implementation of Double Head Faster-RCNN(https://arxiv.org/pdf/1904.06493.pdf).
-    Support supervised contrastive learning (https://arxiv.org/pdf/2004.11362.pdf)
-
-    Components that I implemented for this head are:
-        modeling.roi_heads.roi_heads.DoubleHeadROIHeads (this class)
-        modeling.roi_heads.box_head.FastRCNNDoubleHead  (specify this name in yaml)
-        modeling.fast_rcnn.FastRCNNDoubleHeadOutputLayers
-        modeling.backbone.resnet.BasicBlock
-    """
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-        # fmt: off
-        self.contrastive_branch    = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.ENABLED
-        self.fc_dim                = cfg.MODEL.ROI_BOX_HEAD.FC_DIM
-        self.mlp_head_dim          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
-        self.temperature           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
-
-        self.contrast_loss_weight  = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
-        self.fg_proposals_only     = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.FG_ONLY
-        self.cl_head_only          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY
-        # fmt: on
-
-        # Contrastive Loss head
-        if self.contrastive_branch:
-            self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
-            self.criterion = SupConLoss(self.temperature, self.fg_proposals_only)
-
-    def _forward_box(self, features, proposals):
-        """
-        Forward logic of the box prediction branch.
-
-        Box regression branch: 1Basic -> 4BottleNeck -> GAP
-        Box classification branch: flatten -> fc1 -> fc2 (unfreeze fc2 is doen in rcnn.py)
-                                                      | self.head (ConstrastiveHead)
-                                                      ∨
-                                               Contrastive Loss
-
-        Args:
-            features (list[Tensor]): #level input features for box prediction
-            proposals (list[Instances]): the per-image object proposals with
-                their matching ground truth.
-                Each has fields "proposal_boxes", and "objectness_logits",
-                "gt_classes", "gt_boxes".
-
-        Returns:
-            In training, a dict of losses.
-            In inference, a list of `Instances`, the predicted instances.
-        """
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        box_loc_feat, box_cls_feat = self.box_head(box_features)
-        del box_features
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(box_loc_feat, box_cls_feat)
-
-        if self.contrastive_branch:
-            box_cls_feat_contrast = self.encoder(box_cls_feat)  # feature after contrastive head
-            outputs = FastRCNNContrastOutputs(
-                self.box2box_transform,
-                pred_class_logits,
-                pred_proposal_deltas,
-                proposals,
-                self.smooth_l1_beta,
-                box_cls_feat_contrast,
-                self.criterion,
-                self.contrast_loss_weight,
-                self.fg_proposals_only,
-                self.cl_head_only,
-            )
-        else:
-            outputs = FastRCNNOutputs(
-                self.box2box_transform,
-                pred_class_logits,  # cls_logits and box_deltas returned from OutputLayer
-                pred_proposal_deltas,
-                proposals,
-                self.smooth_l1_beta,
-            )
-
-        if self.training:
-            return outputs.losses()
-        else:
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
-
-
-@ROI_HEADS_REGISTRY.register()
-class NovelRoiHeads(StandardROIHeads):
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-        # fmt: off
-        self.contrastive_branch    = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.ENABLED
-        self.fc_dim                = cfg.MODEL.ROI_BOX_HEAD.FC_DIM
-        self.mlp_head_dim     = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
-        self.temperature           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
-
-        self.contrast_loss_weight  = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
-        self.fg_proposals_only     = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.FG_ONLY
-        self.cl_head_only          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY
-        # fmt: on
-
-        # Contrastive Loss head
-        if self.contrastive_branch:
-            self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
-            self.criterion = SupConLoss(self.temperature, self.fg_proposals_only)
-
-    def _forward_box(self, features, proposals):
-        """
-        Forward logic of the box prediction branch.
-
-        Box regression branch: 1Basic -> 4BottleNeck -> GAP
-        Box classification branch: flatten -> fc1 -> fc2 (unfreeze fc2 is doen in rcnn.py)
-                                                      | self.head (ConstrastiveHead)
-                                                      ∨
-                                               Contrastive Loss
-
-        Args:
-            features (list[Tensor]): #level input features for box prediction
-            proposals (list[Instances]): the per-image object proposals with
-                their matching ground truth.
-                Each has fields "proposal_boxes", and "objectness_logits",
-                "gt_classes", "gt_boxes".
-
-        Returns:
-            In training, a dict of losses.
-            In inference, a list of `Instances`, the predicted instances.
-        """
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        box_loc_feat, box_cls_feat = self.box_head(box_features)
-        del box_features
-        if self.output_layer_name == 'FastRCNNDoubleHeadCosMarginLayers':
-            gt_classes = None
-            if proposals[0].has('gt_classes'):
-                gt_classes = cat([p.gt_classes for p in proposals], dim=0)
-            pred_class_logits, pred_proposal_deltas = self.box_predictor(box_loc_feat, box_cls_feat, gt_classes, self.training)
-        else:
-            pred_class_logits, pred_proposal_deltas = self.box_predictor(box_loc_feat, box_cls_feat)
-
-        if self.contrastive_branch:
-            box_cls_feat_contrast = self.encoder(box_cls_feat)  # feature after contrastive head
-            outputs = FastRCNNContrastOutputs(
-                self.box2box_transform,
-                pred_class_logits,
-                pred_proposal_deltas,
-                proposals,
-                self.smooth_l1_beta,
-                box_cls_feat_contrast,
-                self.criterion,
-                self.contrast_loss_weight,
-                self.fg_proposals_only,
-                self.cl_head_only,
-            )
-        else:
-            outputs = FastRCNNOutputs(
-                self.box2box_transform,
-                pred_class_logits,  # cls_logits and box_deltas returned from OutputLayer
-                pred_proposal_deltas,
-                proposals,
-                self.smooth_l1_beta,
-            )
-
-        if self.training:
-            return outputs.losses()
-        else:
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
-
-
-# @ROI_HEADS_REGISTRY.register()
-# class ContrastiveROIHeads(Res5ROIHeads):
-#     def __init__(self, cfg, input_shape):
-#         super().__init__(cfg, input_shape)
-#         # fmt: on
-#         self.fc_dim               = cfg.MODEL.ROI_BOX_HEAD.FC_DIM
-#         self.mlp_head_dim         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
-#         self.temperature          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
-#         self.contrast_loss_weight = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
-#         self.box_reg_weight       = cfg.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT
-#         self.weight_decay         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.ENABLED
-#         self.decay_steps          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS
-#         self.decay_rate           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE
-
-#         self.num_classes          = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-
-#         self.loss_version         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_VERSION
-#         self.contrast_iou_thres   = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.IOU_THRESHOLD
-#         self.reweight_func        = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.REWEIGHT_FUNC
-
-#         self.cl_head_only         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY
-#         # fmt: off
-
-#         self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
-#         if self.loss_version == 'V1':
-#             self.criterion = SupConLoss(self.temperature, self.contrast_iou_thres, self.reweight_func)
-#         elif self.loss_version == 'V2':
-#             self.criterion = SupConLossV2(self.temperature, self.contrast_iou_thres)
-#         self.criterion.num_classes = self.num_classes  # to be used in protype version
-
-#     def _forward_box(self, features, proposals):
-#         box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-#         box_features = self.box_head(box_features)  # [None, FC_DIM]
-#         pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
-#         box_features_contrast = self.encoder(box_features)
-#         del box_features
-
-#         if self.weight_decay:
-#             storage = get_event_storage()
-#             if int(storage.iter) in self.decay_steps:
-#                 self.contrast_loss_weight *= self.decay_rate
-
-#         outputs = FastRCNNContrastOutputs(
-#             self.box2box_transform,
-#             pred_class_logits,
-#             pred_proposal_deltas,
-#             proposals,
-#             self.smooth_l1_beta,
-#             box_features_contrast,
-#             self.criterion,
-#             self.contrast_loss_weight,
-#             self.box_reg_weight,
-#             self.cl_head_only,
-#         )
-#         if self.training:
-#             return outputs.losses()
-#         else:
-#             pred_instances, _ = outputs.inference(
-#                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-#             )
-#             return pred_instances
-
-
-
-@ROI_HEADS_REGISTRY.register()
-class HallucinatingROIHeads(Res5ROIHeads):
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-        # Initialize the Hallucinator
-        self.hallucinator = FeatureHallucinator(channels=2048)
-        
-        # Hyperparameter for reconstruction loss weight
-        self.lambda_recon = 0.5 
-
-    def _forward_box(self, features, proposals):
-        # 1. Standard RoI Pooling & Res5
-        features = [features[f] for f in self.box_in_features]
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        box_features = self.res5(box_features) # Shape: (N, 2048, 7, 7)
-
-        if self.training:
-            # --- TRAINING PHASE: LEARN TO IMAGINE ---
-            
-            # A. Create "Ground Truth" (The clean features)
-            # We assume the training proposals (mostly) contain the object.
-            target_features = box_features.detach() # Stop gradients to backbone for target
-
-            # B. Create "Synthetic Occlusion" (The input)
-            # Generate a random binary mask (Batch, 1, 7, 7)
-            # Probability 0.3 to drop a pixel (simulate occlusion)
-            mask = torch.rand((box_features.size(0), 1, 7, 7), device=box_features.device) > 0.3
-            corrupted_features = box_features * mask.float()
-
-            # C. Hallucinate
-            repaired_features = self.hallucinator(corrupted_features)
-
-            # D. Reconstruction Loss (MSE)
-            # Force repaired features to look like the original clean features
-            loss_recon = F.mse_loss(repaired_features, target_features)
-
-            # E. Use Repaired Features for Classification
-            # This ensures the Classifier learns to use the "imagined" parts
-            final_features = self.box_head(repaired_features) # pooling
-            predictions = self.box_predictor(final_features)
-            
-            # Add recon loss to the return dictionary (handled by Detectron2)
-            losses = predictions[1] # standard losses
-            # We need to hackily inject this loss. 
-            # In Detectron2, you usually return a dict of losses.
-            # Here, we might need to modify the calling function or add it to a tracking dict.
-            # Ideally:
-            losses["loss_hallucination"] = loss_recon * self.lambda_recon
-            
-            return predictions, losses
-
-        else:
-            # --- INFERENCE PHASE: USE IMAGINATION ---
-            # We don't artificially mask here. The input is NATURALLY occluded (the sofa).
-            # The Hallucinator will see zeros/noise in the occluded area and "fix" it
-            # based on what it learned during training.
-            
-            repaired_features = self.hallucinator(box_features)
-            final_features = self.box_head(repaired_features)
-            predictions = self.box_predictor(final_features)
-            return predictions, {}
-
-
-
-@ROI_HEADS_REGISTRY.register()
-class AttentiveROIHeads(Res5ROIHeads):
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-        
-        # 1. Identify input channels. For ResNet-101/50 C4, this is typically 2048.
-        # The 'res5' block output channels are defined in the backbone config.
-        out_channels = 2048 # usually 2048
-        
-        # 2. OVERRIDE self.box_head
-        # In standard Res5ROIHeads, this is initialized as a heuristic GAP.
-        # We replace it entirely with our learnable module.
-        self.box_head = AttentiveGlobalPooling(out_channels)
-
-    def _forward_box(self, features, proposals):
-        # We override this to ensure explicit control, though simpler overrides might work.
-        # This logic follows the standard Detectron2 Res5ROIHeads flow but clarifies the steps.
-
-        # 1. Get the feature map corresponding to the specific level (usually 'res4')
-        features = [features[f] for f in self.box_in_features]
-        
-        # 2. RoI Pooling/Align -> Output: (N, 1024, 14, 14) usually
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        
-        # 3. Apply the Heavy Res5 Stage -> Output: (N, 2048, 7, 7)
-        # This applies the conv layers (conv5_1, conv5_2, etc.) per ROI
-        box_features = self.res5(box_features)
-        
-        # 4. APPLY ATTENTIVE POOLING (Replaces Global Avg Pool)
-        # Output: (N, 2048)
-        feature_vector = self.box_head(box_features)
-        
-        # 5. Prediction (Class Scores + Box Deltas)
-        predictions = self.box_predictor(feature_vector)
-        
-        del box_features # save memory
-        return predictions, [] # empty list is for "losses" if handled here, but usually handled by calling code
-
-
-@ROI_HEADS_REGISTRY.register()
-class HallucinatingAttentiveROIHeads(Res5ROIHeads):
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-
-        # ---------------------------------------------------------
-        # 1. Hallucination Components
-        # ---------------------------------------------------------
-        # Typically Res5 output is 2048 channels
-        self.hallucinator = FeatureHallucinator(channels=2048)
-        self.lambda_recon = 0.5 
-        self.dropout_rate = 0.3 # Probability to drop pixels during training
-
-        # ---------------------------------------------------------
-        # 2. Attention Components (Overrides default box_head)
-        # ---------------------------------------------------------
-        # We replace the standard Global Average Pooling (GAP) 
-        # with the Attentive Pooling module.
-        self.box_head = AttentiveGlobalPooling(out_channels=2048)
-
-    def forward(self, images, features, proposals, targets=None):
-        """
-        We must override the main forward to handle the auxiliary 
-        hallucination loss returned by _forward_box.
-        """
-        del images  # Unused
-        
-        # 1. Label and sample proposals (Standard Detectron2 logic)
-        if self.training:
-            proposals = self.label_and_sample_proposals(proposals, targets)
-        del targets
-
-        # 2. Shared Subnet (Res5) + Hallucination + Attention
-        # Note: We modified _forward_box to return (predictions, aux_losses)
-        predictions, aux_losses = self._forward_box(features, proposals)
-
-        if self.training:
-            del features
-            # 3. Calculate Class/Box Losses (Standard)
-            losses = self.box_predictor.losses(predictions, proposals)
-            
-            # 4. Add Hallucination Loss
-            losses.update(aux_losses)
-            return proposals, losses
-        else:
-            # Inference
-            pred_instances, _ = self.box_predictor.inference(predictions, proposals)
-            return pred_instances, {}
-
-    def _forward_box(self, features, proposals):
-        # 1. Fetch Features
-        features = [features[f] for f in self.box_in_features]
-        
-        # 2. RoI Pooling (Standard)
-        # Output: (N, 2048, 14, 14) or similar depending on stride
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        
-        # 3. Res5 Stage (Standard)
-        # Output: (N, 2048, 7, 7)
-        box_features = self.res5(box_features)
-
+        # default pooled features and aux losses
+        pooled = None
         aux_losses = {}
 
-        if self.training:
-            # --- TRAINING: LEARN TO IMAGINE ---
-            
-            # A. Create "Ground Truth" (Clean features)
-            target_features = box_features.detach()
+        if self.nsh_enabled and self.training and self.fhm_train:
+            # base training: train hallucinator and compute aux losses
+            R, C, H, W = box_features.shape
+            device = box_features.device
 
-            # B. Create "Synthetic Occlusion"
-            # Random binary mask (Batch, 1, 7, 7)
-            mask = torch.rand((box_features.size(0), 1, 7, 7), device=box_features.device) > self.dropout_rate
-            corrupted_features = box_features * mask.float()
+            # sample subset for hallucination (efficiency)
+            inds = sample_indices(R, self.fhm_sample_ratio, max_samples=self.fhm_max_samples, device=device)
 
-            # C. Hallucinate (Repair the features)
-            repaired_features = self.hallucinator(corrupted_features)
+            # build masked features for the sampled indices (others remain intact)
+            masked_all = box_features.clone()
+            masked_subset, mask = apply_random_block_mask(box_features[inds], block_h=3, block_w=3)
+            masked_all[inds] = masked_subset
 
-            # D. Reconstruction Loss
-            loss_recon = F.mse_loss(repaired_features, target_features)
-            aux_losses["loss_hallucination"] = loss_recon * self.lambda_recon
+            # optional spatial reduction before FHM (cheap)
+            if self.fhm_spatial_red > 1:
+                new_h = max(1, H // self.fhm_spatial_red)
+                new_w = max(1, W // self.fhm_spatial_red)
+                small = F.adaptive_avg_pool2d(masked_all, (new_h, new_w))
+                recon_small = self.fhm(small)
+                recon = F.interpolate(recon_small, size=(H, W), mode="bilinear", align_corners=False)
+            else:
+                recon = self.fhm(masked_all)
 
-        else:
-            # --- INFERENCE: USE IMAGINATION ---
-            # Input is naturally occluded; just repair it.
-            repaired_features = self.hallucinator(box_features)
+            # reconstruction loss computed on sampled indices only
+            aux_losses["loss_rec"] = self.lambda_rec * F.mse_loss(recon[inds], box_features[inds], reduction="mean")
 
-        # 4. ATTENTIVE POOLING
-        # Instead of GAP, we use the Attentive Head on the *repaired* features.
-        # Input: (N, 2048, 7, 7) -> Output: (N, 2048)
-        feature_vector = self.box_head(repaired_features)
+            # AGP & sparsity on reconstructed features
+            pooled_rec, mask_rec, sparsity = self.agp(recon)
+            aux_losses["loss_sp"] = self.lambda_sp * sparsity
 
-        # 5. Prediction
-        predictions = self.box_predictor(feature_vector)
+            pooled = pooled_rec
 
-        return predictions, aux_losses
+            # SVA: compute only on foreground proposals if gt_classes available
+            if proposals and proposals[0].has("gt_classes") and self.sva.text_embeddings is not None:
+                gt_classes = torch.cat([p.gt_classes for p in proposals], dim=0).to(device)
+                fg_inds = torch.nonzero((gt_classes >= 0) & (gt_classes < self.num_classes)).squeeze(1)
+                if fg_inds.numel() > 0:
+                    # ensure text embeddings on same device
+                    if self.sva.text_embeddings.device != pooled.device:
+                        self.sva.text_embeddings = self.sva.text_embeddings.to(pooled.device)
+                    zvis = self.sva(pooled[fg_inds])
+                    loss_sva = self.sva.contrastive_loss(zvis, gt_classes[fg_inds].long())
+                    aux_losses["loss_sva"] = self.lambda_sva * loss_sva
 
-
-@ROI_HEADS_REGISTRY.register()
-class ContrastiveROIHeads(Res5ROIHeads):
-    """
-    Res5ROIHeads with Contrastive Learning support.
-    Adapted for DeFRCN with ResNet-101 (C4 Backbone).
-    """
-    def __init__(self, cfg, input_shape):
-        
-        print(f"DEBUG: ContrastiveROIHeads (Res5) initialized.")
-
-        super().__init__(cfg, input_shape)
-        
-        # fmt: on
-        self.fc_dim               = cfg.MODEL.ROI_BOX_HEAD.FC_DIM
-        self.mlp_head_dim         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
-        self.temperature          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
-        self.contrast_loss_weight = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
-        self.box_reg_weight       = cfg.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT
-        self.weight_decay         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.ENABLED
-        self.decay_steps          = set(cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS)
-        self.decay_rate           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE
-
-        self.num_classes          = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-
-        self.loss_version         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_VERSION
-        self.contrast_iou_thres   = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.IOU_THRESHOLD
-        self.reweight_func        = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.REWEIGHT_FUNC
-        self.cl_head_only         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY
-        # fmt: off
-
-        # --- CRITICAL FIX FOR RES5 BACKBONE ---
-        # ResNet101 Res5 block outputs 2048 channels. 
-        # input_shape.channels is usually 1024 (Res4). Res5 expands it.
-        # We try to detect the correct input dim for the encoder.
-        if hasattr(self, "res5"):
-             # If we can inspect the last layer of res5, great, otherwise assume expansion
-             # ResNet usually expands 1024 -> 2048 in the final stage
-             encoder_in_dim = 2048 
-        else:
-             encoder_in_dim = self.fc_dim
-
-        self.encoder = ContrastiveHead(encoder_in_dim, self.mlp_head_dim)
-        
-        if self.loss_version == 'V1':
-            self.criterion = SupConLoss(self.temperature, self.contrast_iou_thres, self.reweight_func)
-        elif self.loss_version == 'V2':
-            self.criterion = SupConLossV2(self.temperature, self.contrast_iou_thres)
-        
-        if hasattr(self.criterion, "num_classes"):
-            self.criterion.num_classes = self.num_classes
-
-    def _forward_box(self, features, proposals):
-        # 1. Proposal Boxes
-        proposal_boxes = [x.proposal_boxes for x in proposals]
-        
-        # 2. Shared ROI Transform (Pooler + Res5 Block)
-        # Res5ROIHeads uses this method. It pools features AND passes them through Res5.
-        # Output Shape: [Total_Proposals, 2048, 7, 7]
-        box_features = self._shared_roi_transform(features, proposal_boxes)
-        
-        # 3. Global Average Pooling
-        # We must flatten the 7x7 spatial features to get a vector for the heads.
-        # Output Shape: [Total_Proposals, 2048]
-        feature_pooled = box_features.mean(dim=[2, 3])
-
-        # 4. Box Predictor (Classification + Regression)
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(feature_pooled)
-
-        # 5. Contrastive Encoding
-        # We pass the POOLED features to the encoder
-        box_features_contrast = self.encoder(feature_pooled)
-        
-        # Clean up spatial features to save memory
-        del box_features
-
-        if self.weight_decay:
-            storage = get_event_storage()
-            if int(storage.iter) in self.decay_steps:
-                self.contrast_loss_weight *= self.decay_rate
-
-        outputs = FastRCNNContrastOutputs(
-            self.box2box_transform,
-            pred_class_logits,
-            pred_proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-            box_features_contrast,
-            self.criterion,
-            self.contrast_loss_weight,
-            self.box_reg_weight,
-            self.cl_head_only,
-        )
-        if self.training:
-            return outputs.losses()
-        else:
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
-
-@ROI_HEADS_REGISTRY.register()
-class ContrastiveROIHeadsWithStorage(StandardROIHeads):
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-        # fmt: on
-        self.fc_dim               = cfg.MODEL.ROI_BOX_HEAD.FC_DIM
-        self.mlp_head_dim         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
-        self.temperature          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
-        self.contrast_loss_weight = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
-        self.box_reg_weight       = cfg.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT
-        self.weight_decay         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.ENABLED
-        self.decay_steps          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS
-        self.decay_rate           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE
-
-        self.num_classes          = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-
-        self.contrast_iou_thres   = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.IOU_THRESHOLD
-        self.reweight_func        = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.REWEIGHT_FUNC
-
-        self.use_storage          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.STORAGE.ENABLED
-        self.queue_size           = cfg.MODEL.MOCO.QUEUE_SIZE
-        self.storage_start_iter   = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.STORAGE.START
-        self.storage_threshold    = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.STORAGE.IOU_THRESHOLD
-        # fmt: off
-
-        # momentum encoding queue
-        self.register_buffer('queue', torch.randn(self.queue_size, self.mlp_head_dim))
-        self.register_buffer('queue_label', torch.empty(self.queue_size).fill_(-1).long())
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-        self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
-        self.criterion = SupConLossWithStorage(self.temperature, self.contrast_iou_thres)
-        self.criterion.num_classes = self.num_classes  # to be used in protype version
-
-    def _forward_box(self, features, proposals):
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        box_features = self.box_head(box_features)  # [None, FC_DIM]
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
-        box_features_contrast = self.encoder(box_features)
-        del box_features
-
-        if self.use_storage and self.training:
-            event = get_event_storage()
-            if int(event.iter) >= self.storage_start_iter:
-                iou = cat([p.iou for p in proposals])
-                label = cat([p.gt_classes for p in proposals], dim=0)
-                idx = (iou >= self.storage_threshold).long()
-                self._dequeue_and_enqueue(box_features_contrast, label, idx)
-
-        if self.weight_decay:
-            storage = get_event_storage()
-            if int(storage.iter) in self.decay_steps:
-                self.contrast_loss_weight *= self.decay_rate
-
-        outputs = ContrastOutputsWithStorage(
-            self.box2box_transform,
-            pred_class_logits,
-            pred_proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-            box_features_contrast,
-            self.criterion,
-            self.contrast_loss_weight,
-            self.queue,
-            self.queue_label,
-            self.box_reg_weight,
-        )
-        if self.training:
-            return outputs.losses()
-        else:
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
-
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, key, label, idx):
-        keys = select_all_gather(key, idx)
-        labels = select_all_gather(label, idx)
-
-        batch_size = keys.shape[0]
-
-        ptr = int(self.queue_ptr)
-        if ptr + batch_size <= self.queue.shape[0]:
-            self.queue[ptr:ptr + batch_size] = keys
-            self.queue_label[ptr:ptr + batch_size] = labels
-        else:
-            rem = self.queue.shape[1] - ptr
-            self.queue[ptr:ptr + rem] = keys[:rem, :]
-            self.queue_label[ptr:ptr + rem] = labels[:rem]
-
-        ptr += batch_size
-        if ptr >= self.queue.shape[0]:
-            ptr = 0
-        self.queue_ptr[0] = ptr
-
-
-@ROI_HEADS_REGISTRY.register()
-class ContrastiveROIHeadsWithPrototype(StandardROIHeads):
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-        # fmt: on
-        self.temperature          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
-        self.contrast_loss_weight = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
-        self.box_reg_weight       = cfg.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT
-        self.box_cls_weight       = cfg.MODEL.ROI_BOX_HEAD.BOX_CLS_WEIGHT
-        self.weight_decay         = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.ENABLED
-        self.decay_steps          = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS
-        self.decay_rate           = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE
-
-        self.num_classes          = cfg.MODEL.ROI_HEADS.NUM_CLASSES
-
-        self.prototype_dataset    = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.PROTOTYPE.DATASET
-        self.prototype_path       = cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.PROTOTYPE.PATH
-        # fmt: off
-
-        # self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
-
-        prototype_tensor = torch.load(self.prototype_path)  # [num_classes+1, 1024]
-        prototype_tensor = prototype_tensor[:-1, :]  # [num_classes, 1024]
-        if self.prototype_dataset == 'PASCAL VOC':
-            assert prototype_tensor.shape == (15, 1024)
-            prototype_label = torch.arange(15)
-        else:
-            raise(NotImplementedError, 'prototype not implemented for non-VOC dataset')
-        self.register_buffer('prototype', prototype_tensor)
-        self.register_buffer('prototype_label', prototype_label)
-
-        self.criterion = SupConLossWithPrototype(self.temperature)
-        self.criterion.num_classes = self.num_classes
-
-    def _forward_box(self, features, proposals):
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        box_features = self.box_head(box_features)  # [None, FC_DIM]
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
-
-        box_features_normalized = F.normalize(box_features)
-        del box_features
-
-        if self.weight_decay:
-            storage = get_event_storage()
-            if int(storage.iter) in self.decay_steps:
-                self.contrast_loss_weight *= self.decay_rate
-
-        outputs = ContrastWithPrototypeOutputs(
-            self.box2box_transform,
-            pred_class_logits,
-            pred_proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-            box_features_normalized,
-            self.prototype,
-            self.prototype_label,
-            self.criterion,
-            self.contrast_loss_weight,
-            self.box_reg_weight,
-            self.box_cls_weight,
-        )
-        if self.training:
-            return outputs.losses()
-        else:
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
-
-
-@ROI_HEADS_REGISTRY.register()
-class ContrastiveROIHeadsPrototypeWithMLP(ContrastiveROIHeadsWithPrototype):
-    def __init__(self, cfg, input_shape):
-        super().__init__(cfg, input_shape)
-        # fmt: on
-        self.fc_dim                      =  cfg.MODEL.ROI_BOX_HEAD.FC_DIM
-        self.mlp_head_dim                =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM
-        self.temperature                 =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE
-
-        self.box_reg_weight              =  cfg.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT
-        self.box_cls_weight              =  cfg.MODEL.ROI_BOX_HEAD.BOX_CLS_WEIGHT
-
-        self.contrast_loss_weight        =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT
-        self.weight_decay                =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.ENABLED
-        self.decay_steps                 =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS
-        self.decay_rate                  =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE
-
-        self.num_classes                 =  cfg.MODEL.ROI_HEADS.NUM_CLASSES
-
-        self.prototype_dataset           =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.PROTOTYPE.DATASET
-        self.prototype_path              =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.PROTOTYPE.PATH
-        self.disable_prototype_mlp_grad  =  cfg.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.PROTOTYPE.DISABLE_PROTOTYPE_GRAD
-        # fmt: off
-
-        # mlp head, return L-2 normalized features
-        self.encoder = ContrastiveHead(self.fc_dim, self.mlp_head_dim)
-
-        # prototype obtained from base training
-        prototype_tensor = torch.load(self.prototype_path)  # [num_classes+1, 1024]
-        prototype_tensor = prototype_tensor[:-1, :]  # [num_classes, 1024]
-        if self.prototype_dataset == 'PASCAL VOC':
-            assert prototype_tensor.shape == (15, 1024)
-            prototype_label = torch.arange(15)
-        else:
-            raise(NotImplementedError, 'prototype not implemented for non-VOC dataset')
-        self.register_buffer('prototype', prototype_tensor)
-        self.register_buffer('prototype_label', prototype_label)
-
-        # Supervised Contrastive Loss With Prototype
-        self.criterion = SupConLossWithPrototype(self.temperature)
-        self.criterion.num_classes = self.num_classes
-
-    def _forward_box(self, features, proposals):
-        box_features = self.box_pooler(features, [x.proposal_boxes for x in proposals])
-        box_features = self.box_head(box_features)  # [None, FC_DIM]
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(box_features)
-
-        box_features = F.normalize(box_features)
-        box_features_enc = self.encoder(box_features)
-        del box_features
-
-        if self.disable_prototype_mlp_grad:
+        elif self.nsh_enabled and self.training and (not self.fhm_train):
+            # novel training: freeze FHM (no aux losses). Use frozen FHM to project.
             with torch.no_grad():
-                proto_features_enc = self.encoder(self.prototype)
-        else:
-            proto_features_enc = self.encoder(self.prototype)
+                was_train = self.fhm.training
+                self.fhm.eval()
+                recon = self.fhm(box_features)
+                if was_train:
+                    self.fhm.train(was_train)
+            pooled, _, _ = self.agp(recon)
 
-        if self.weight_decay:
-            storage = get_event_storage()
-            if int(storage.iter) in self.decay_steps:
-                self.contrast_loss_weight *= self.decay_rate
+        elif self.nsh_enabled and (not self.training):
+            # inference: use FHM (no gradients)
+            recon = self.fhm(box_features)
+            pooled, _, _ = self.agp(recon)
 
-        outputs = ContrastWithPrototypeOutputs(
+        # fallback pooling if none computed
+        if pooled is None:
+            pooled = box_features.mean(dim=[2, 3])  # (R, C)
+
+        # standard Fast R-CNN predictions
+        pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled)
+        outputs = FastRCNNOutputs(
             self.box2box_transform,
             pred_class_logits,
             pred_proposal_deltas,
             proposals,
             self.smooth_l1_beta,
-            box_features_enc,
-            proto_features_enc,
-            self.prototype_label,
-            self.criterion,
-            self.contrast_loss_weight,
-            self.box_reg_weight,
-            self.box_cls_weight,
         )
+
         if self.training:
-            return outputs.losses()
+            losses = outputs.losses()
+            # merge auxiliary losses
+            losses.update(aux_losses)
+            return [], losses
         else:
-            pred_instances, _ = outputs.inference(
-                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
-            )
-            return pred_instances
+            pred_instances, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
+            return pred_instances, {}

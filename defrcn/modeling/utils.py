@@ -38,3 +38,47 @@ def cat(tensors, dim=0):
     if len(tensors) == 1:
         return tensors[0]
     return torch.cat(tensors, dim)
+
+def apply_random_block_mask(x: torch.Tensor, block_h: int = 3, block_w: int = 3, noise_level: float = 1.0):
+    """
+    x: (R, C, H, W)
+    returns:
+        masked_x: Input with blocks filled with noise (simulating occlusion)
+        mask: Binary mask (1 for valid, 0 for occluded) for loss computation
+    """
+    R, C, H, W = x.shape
+    mask = x.new_ones((R, 1, H, W))
+    
+    # Calculate start positions
+    max_h_start = max(1, H - block_h + 1)
+    max_w_start = max(1, W - block_w + 1)
+    h_starts = torch.randint(0, max_h_start, (R,), device=x.device)
+    w_starts = torch.randint(0, max_w_start, (R,), device=x.device)
+    
+    # Create a clone for the masked input
+    masked_x = x.clone()
+    
+    for i in range(R):
+        hs = int(h_starts[i].item())
+        ws = int(w_starts[i].item())
+        he = min(H, hs + block_h)
+        we = min(W, ws + block_w)
+        
+        # Update the binary mask for loss tracking
+        mask[i, :, hs:he, ws:we] = 0.0
+        
+        # SUGGESTION APPLIED HERE:
+        # Instead of zeroing out (masked_x[...] = 0), fill with noise.
+        # This simulates X_occ (occluder features) described in Eq 8.
+        noise = torch.randn((C, he-hs, we-ws), device=x.device) * noise_level
+        masked_x[i, :, hs:he, ws:we] = noise
+
+    return masked_x, mask
+
+
+def sample_indices(total: int, ratio: float, max_samples: Optional[int] = None, device=None):
+    k = int(total * ratio)
+    if max_samples is not None:
+        k = min(k, int(max_samples))
+    k = max(1, k)
+    return torch.randperm(total, device=device)[:k]

@@ -9,6 +9,7 @@ MODEL:
     ENABLE_DECOUPLE: True
     BACKWARD_SCALE: 0.0
   ROI_HEADS:
+    NAME: "HallucinatingAttentiveROIHeads"
     NUM_CLASSES: 15
     ENABLE_DECOUPLE: True
     BACKWARD_SCALE: 0.75

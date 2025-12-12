@@ -1,15 +1,8 @@
 import torch
 import clip
 import numpy as np
-import os
 from detectron2.data import MetadataCatalog
-import defrcn.data.builtin  # Register datasets
 
-import torch
-import clip
-import numpy as np
-from detectron2.data import MetadataCatalog
-import defrcn.data.builtin  # ensure datasets are registered
 
 # --- CONFIG ---
 DATASET_NAME = "voc_2012_trainval_all1"
