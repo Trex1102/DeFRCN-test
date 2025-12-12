@@ -505,7 +505,6 @@ class Res5ROIHeadsNSHEfficient(Res5ROIHeads):
     """
 
     def __init__(self, cfg, input_shape):
-        # initialize base res5 ROI head (sets pooler, res5, box_predictor)
         super().__init__(cfg, input_shape)
 
         # NSH config

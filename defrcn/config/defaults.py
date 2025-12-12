@@ -40,64 +40,38 @@ _CC.TEST.PCB_REPULSION = False
 _CC.SOLVER.WEIGHT_DECAY = 5e-5
 _CC.MUTE_HEADER = True
 
-_CC.MODEL.ROI_BOX_HEAD = CN()
 
-_CC.MODEL.ROI_BOX_HEAD.NAME = "FastRCNNConvFCHead"
-# Default weights on (dx, dy, dw, dh) for normalizing bbox regression targets
-# These are empirically chosen to approximately lead to unit variance targets
-_CC.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS = (10.0, 10.0, 5.0, 5.0)
-# The transition point from L1 to L2 loss. Set to 0.0 to make the loss simply L1.
-_CC.MODEL.ROI_BOX_HEAD.SMOOTH_L1_BETA = 0.0
-_CC.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION = 7
-# set sampling ratio to 0 to sample densely
-_CC.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO = 0
-# Type of pooling operation applied to the incoming feature map for each RoI
-_CC.MODEL.ROI_BOX_HEAD.POOLER_TYPE = "ROIAlignV2"
+# ---------------------------------------------------------------------------- #
+#  NSH Config
+# ---------------------------------------------------------------------------- #
+_CC.MODEL.NSH = CN()
+_CC.MODEL.NSH.ENABLED = True       # Master switch
 
-_CC.MODEL.ROI_BOX_HEAD.NUM_FC = 2
-# Hidden layer dimension for FC layers in the RoI box head
-_CC.MODEL.ROI_BOX_HEAD.FC_DIM = 1024
-_CC.MODEL.ROI_BOX_HEAD.NUM_CONV = 0
-# Channel dimension for Conv layers in the RoI box head
-_CC.MODEL.ROI_BOX_HEAD.CONV_DIM = 256
-# Normalization method for the convolution layers.
-# Options: "" (no norm), "GN", "SyncBN".
-_CC.MODEL.ROI_BOX_HEAD.NORM = ""
-# Whether to use class agnostic for bbox regression
-_CC.MODEL.ROI_BOX_HEAD.CLS_AGNOSTIC_BBOX_REG = False
+# ---- Base / Novel Training Control ---- #
+_CC.MODEL.NSH.FHM_TRAIN = True     # True = Base training, False = Novel ft
 
-_CC.MODEL.ROI_BOX_HEAD.BOX_REG_WEIGHT = 1.0
-_CC.MODEL.ROI_BOX_HEAD.BOX_CLS_WEIGHT = 1.0
+# ---- FHM Efficiency Options ---- #
+_CC.MODEL.NSH.FHM_SAMPLE_RATIO = 0.25     # Use 25% of RoIs for hallucination
+_CC.MODEL.NSH.FHM_MAX_SAMPLES = 128       # Max number of hallucination RoIs
+_CC.MODEL.NSH.FHM_SPATIAL_RED = 1         # Spatial downsample (1 = none)
+_CC.MODEL.NSH.FHM_HIDDEN = 256            # Hidden channels in FHM
 
+# ---- SVA / CLIP ---- #
+_CC.MODEL.NSH.CLIP_MODEL = "ViT-B/32"
+_CC.MODEL.NSH.CLIP_DIM = 512
+_CC.MODEL.NSH.CLIP_TAU = 0.07
+_CC.MODEL.NSH.CLASS_NAMES = []            # user should fill dataset class names
 
-_CC.MODEL.ROI_BOX_HEAD.SUB_FC_DIM = 1024
+# ---- Loss Weights ---- #
+_CC.MODEL.NSH.LAMBDA_REC = 1.0
+_CC.MODEL.NSH.LAMBDA_SVA = 0.1
+_CC.MODEL.NSH.LAMBDA_SP  = 0.01
 
+# ---------------------------------------------------------------------------- #
+#  Solver
+# ---------------------------------------------------------------------------- #
+_CC.SOLVER.WEIGHT_DECAY = 5e-5
 
-# perform Supervised Contrastive Loss within batch
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH = CN({'ENABLED': False})  # to be used to enable contrastive loss for double head
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.MLP_FEATURE_DIM = 128
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.TEMPERATURE = 0.1
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_WEIGHT = 1.0
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY = CN({'ENABLED': False})
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.STEPS = [8000, 16000]
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.DECAY.RATE = 0.2
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.IOU_THRESHOLD = 0.5
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.LOSS_VERSION = 'V1'
-_CC.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.REWEIGHT_FUNC = 'none'
-
-# attentive pooling
-
-_CC.MODEL.HALLUCINATOR_MODULE = CN()
-_CC.MODEL.ATTENTIVE_MODULE = CN()
-
-_CC.MODEL.HALLUCINATOR_MODULE.FREEZE = False
-_CC.MODEL.ATTENTIVE_MODULE.FREEZE = False
+_CC.MUTE_HEADER = True
 
 
-
-
-
-
-
-# train the contrastive head only
-_C.MODEL.ROI_BOX_HEAD.CONTRASTIVE_BRANCH.HEAD_ONLY = False
