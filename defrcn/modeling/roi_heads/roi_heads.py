@@ -657,3 +657,145 @@ class Res5ROIHeadsNSHEfficient(Res5ROIHeads):
         else:
             pred_instances, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
             return pred_instances, {}
+
+
+
+
+@ROI_HEADS_REGISTRY.register()
+class Res5ROIHeadsNSHEfficient2(Res5ROIHeads):
+    """
+    Extends the official Res5ROIHeads by adding:
+      - AttentiveGlobalPooling (AGP)
+      - FeatureHallucinationModule (FHM)
+
+    Efficiency knobs in cfg.MODEL.NSH:
+      - ENABLED (bool)
+      - FHM_SAMPLE_RATIO (float)
+      - FHM_MAX_SAMPLES (int)
+      - FHM_SPATIAL_RED (int)
+      - FHM_HIDDEN (int)
+      - LAMBDA_REC, LAMBDA_SP
+      - FHM_TRAIN (bool) (True for base training, False for novel fine-tuning)
+    """
+
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+
+        # NSH config
+        ns_cfg = getattr(cfg.MODEL, "NSH", {}) or {}
+        self.nsh_enabled = bool(ns_cfg.get("ENABLED", True))
+
+        if not self.nsh_enabled:
+            return
+
+        # Efficiency knobs
+        self.fhm_sample_ratio = float(ns_cfg.get("FHM_SAMPLE_RATIO", 0.25))
+        self.fhm_max_samples = int(ns_cfg.get("FHM_MAX_SAMPLES", 128))
+        self.fhm_spatial_red = int(ns_cfg.get("FHM_SPATIAL_RED", 1))
+        self.fhm_train = bool(ns_cfg.get("FHM_TRAIN", True))  # True for base training, False for novel
+
+        # loss weights (SVA removed)
+        self.lambda_rec = float(ns_cfg.get("LAMBDA_REC", 1.0))
+        self.lambda_sp = float(ns_cfg.get("LAMBDA_SP", 0.01))
+
+        # reuse out_channels set by parent (Res5ROIHeads)
+        out_ch = getattr(self, "out_channels", None)
+        if out_ch is None:
+            # fallback (shouldn't happen if parent built res5)
+            out_ch = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS * (2 ** 3)
+            self.out_channels = out_ch
+
+        # NSH modules
+        hidden = int(ns_cfg.get("FHM_HIDDEN", max(64, out_ch // 4)))
+        self.agp = AttentiveGlobalPooling(out_ch)
+        self.fhm = FeatureHallucinationModule(out_ch, hidden_channels=hidden)
+
+        # NOTE: SVA/CLIP-related code removed
+
+    def forward(self, images, features, proposals, targets=None):
+        # reuse parent's proposal labeling & sampling
+        del images
+        if self.training:
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        del targets
+
+        proposal_boxes = [x.proposal_boxes for x in proposals]
+        # _shared_roi_transform is inherited from Res5ROIHeads and already does pooler+res5
+        box_features = self._shared_roi_transform([features[f] for f in self.in_features], proposal_boxes)
+        # box_features: (R, C, H, W)
+
+        # default pooled features and aux losses
+        pooled = None
+        aux_losses = {}
+
+        if self.nsh_enabled and self.training and self.fhm_train:
+            # base training: train hallucinator and compute aux losses
+            R, C, H, W = box_features.shape
+            device = box_features.device
+
+            # sample subset for hallucination (efficiency)
+            inds = sample_indices(R, self.fhm_sample_ratio, max_samples=self.fhm_max_samples, device=device)
+
+            # build masked features for the sampled indices (others remain intact)
+            masked_all = box_features.clone()
+            masked_subset, mask = apply_random_block_mask(box_features[inds], block_h=3, block_w=3)
+            masked_all[inds] = masked_subset
+
+            # optional spatial reduction before FHM (cheap)
+            if self.fhm_spatial_red > 1:
+                new_h = max(1, H // self.fhm_spatial_red)
+                new_w = max(1, W // self.fhm_spatial_red)
+                small = F.adaptive_avg_pool2d(masked_all, (new_h, new_w))
+                recon_small = self.fhm(small)
+                recon = F.interpolate(recon_small, size=(H, W), mode="bilinear", align_corners=False)
+            else:
+                recon = self.fhm(masked_all)
+
+            # reconstruction loss computed on sampled indices only
+            aux_losses["loss_rec"] = self.lambda_rec * F.mse_loss(recon[inds], box_features[inds], reduction="mean")
+
+            # AGP & sparsity on reconstructed features
+            pooled_rec, mask_rec, sparsity = self.agp(recon)
+            aux_losses["loss_sp"] = self.lambda_sp * sparsity
+
+            pooled = pooled_rec
+
+            # SVA removed — no semantic visual alignment or CLIP losses
+
+        elif self.nsh_enabled and self.training and (not self.fhm_train):
+            # novel training: freeze FHM (no aux losses). Use frozen FHM to project.
+            with torch.no_grad():
+                was_train = self.fhm.training
+                self.fhm.eval()
+                recon = self.fhm(box_features)
+                if was_train:
+                    self.fhm.train(was_train)
+            pooled, _, _ = self.agp(recon)
+
+        elif self.nsh_enabled and (not self.training):
+            # inference: use FHM (no gradients)
+            recon = self.fhm(box_features)
+            pooled, _, _ = self.agp(recon)
+
+        # fallback pooling if none computed
+        if pooled is None:
+            pooled = box_features.mean(dim=[2, 3])  # (R, C)
+
+        # standard Fast R-CNN predictions
+        pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled)
+        outputs = FastRCNNOutputs(
+            self.box2box_transform,
+            pred_class_logits,
+            pred_proposal_deltas,
+            proposals,
+            self.smooth_l1_beta,
+        )
+
+        if self.training:
+            losses = outputs.losses()
+            # merge auxiliary losses
+            losses.update(aux_losses)
+            return [], losses
+        else:
+            pred_instances, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
+            return pred_instances, {}

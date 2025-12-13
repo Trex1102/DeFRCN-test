@@ -45,14 +45,14 @@ class GeneralizedRCNN(nn.Module):
                 else:
                     logging.info("MODEL.NSH.FHM_TRAIN=False but roi_heads has no attribute 'fhm' to freeze.")
 
-            try:
-                if hasattr(self.roi_heads, "sva") and getattr(self.roi_heads.sva, "text_embeddings", None) is not None:
-                    emb = self.roi_heads.sva.text_embeddings
-                    if emb.device != self.device:
-                        self.roi_heads.sva.text_embeddings = emb.to(self.device)
-                        print("Moved SVA text embeddings to device:", self.device)
-            except Exception as e:
-                logging.warning("Failed to move SVA text embeddings to device: %s", e)
+            # try:
+            #     if hasattr(self.roi_heads, "sva") and getattr(self.roi_heads.sva, "text_embeddings", None) is not None:
+            #         emb = self.roi_heads.sva.text_embeddings
+            #         if emb.device != self.device:
+            #             self.roi_heads.sva.text_embeddings = emb.to(self.device)
+            #             print("Moved SVA text embeddings to device:", self.device)
+            # except Exception as e:
+            #     logging.warning("Failed to move SVA text embeddings to device: %s", e)
 
 
 
