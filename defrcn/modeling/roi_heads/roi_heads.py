@@ -799,3 +799,171 @@ class Res5ROIHeadsNSHEfficient2(Res5ROIHeads):
         else:
             pred_instances, _ = outputs.inference(self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img)
             return pred_instances, {}
+
+
+@ROI_HEADS_REGISTRY.register()
+class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
+    """
+    Res5 ROI head with NSH (AGP + FHM) improvements:
+      - Reconstruct pre-Res5 pooled RoI features (pooler outputs).
+      - Compute reconstruction loss on masked subset only, normalized by LayerNorm.
+      - Stable residual scaling and smaller mask blocks.
+      - Config flag MODEL.NSH.USE_RECON_FOR_PRED (default False).
+    """
+
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+
+        ns_cfg = getattr(cfg.MODEL, "NSH", {}) or {}
+        self.nsh_enabled = bool(ns_cfg.get("ENABLED", True))
+        if not self.nsh_enabled:
+            return
+
+        # Efficiency knobs / hyperparams
+        self.fhm_sample_ratio = float(ns_cfg.get("FHM_SAMPLE_RATIO", 0.25))
+        self.fhm_max_samples = int(ns_cfg.get("FHM_MAX_SAMPLES", 128))
+        self.fhm_spatial_red = int(ns_cfg.get("FHM_SPATIAL_RED", 1))
+        self.fhm_train = bool(ns_cfg.get("FHM_TRAIN", True))
+
+        # loss weights
+        self.lambda_rec = float(ns_cfg.get("LAMBDA_REC", 1.0))
+        self.lambda_sp = float(ns_cfg.get("LAMBDA_SP", 0.01))
+
+        # whether to use reconstructed features for prediction (False = aux-only)
+        self.use_recon_for_pred = bool(ns_cfg.get("USE_RECON_FOR_PRED", False))
+
+        # channels
+        out_ch = getattr(self, "out_channels", None)
+        if out_ch is None:
+            out_ch = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS * (2 ** 3)
+            self.out_channels = out_ch
+
+        # modules
+        hidden = int(ns_cfg.get("FHM_HIDDEN", max(64, out_ch // 4)))
+        self.agp = AttentiveGlobalPooling(out_ch)
+        # FHM expected to accept hidden_channels kwarg
+        self.fhm = FeatureHallucinationModule(out_ch, hidden_channels=hidden)
+
+        # a small residual scaling factor to stabilize optimization (start near masked input)
+        self.register_buffer("fhm_res_scale", torch.tensor(float(ns_cfg.get("FHM_RES_SCALE", 0.1)), dtype=torch.float32))
+
+    def forward(self, images, features, proposals, targets=None):
+        del images
+        if self.training:
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        del targets
+
+        proposal_boxes = [x.proposal_boxes for x in proposals]
+
+        # --- IMPORTANT CHANGE: pooler outputs (pre-Res5) are the reconstruction targets ---
+        # roi_pooled: (R, C, H, W)
+        roi_pooled = self.pooler([features[f] for f in self.in_features], proposal_boxes)
+
+        # compute original Res5 outputs (without any masking) for safe baseline
+        box_features_orig = self.res5(roi_pooled)
+        pooled_orig, mask_orig, sparsity_orig = self.agp(box_features_orig)
+
+        pooled = None
+        aux_losses = {}
+
+        if self.nsh_enabled and self.training and self.fhm_train:
+            R, C, H, W = roi_pooled.shape
+            device = roi_pooled.device
+
+            # sample subset indices for hallucination
+            inds = sample_indices(R, self.fhm_sample_ratio, max_samples=self.fhm_max_samples, device=device)
+
+            # masked subset only (avoid identity learning)
+            masked_subset, _ = apply_random_block_mask(roi_pooled[inds], block_h=2, block_w=2)
+
+            # optional spatial reduction before FHM for efficiency
+            if self.fhm_spatial_red > 1:
+                new_h = max(1, H // self.fhm_spatial_red)
+                new_w = max(1, W // self.fhm_spatial_red)
+                small_masked = F.adaptive_avg_pool2d(masked_subset, (new_h, new_w))
+                recon_small = self.fhm(small_masked)
+                recon_subset = F.interpolate(recon_small, size=(H, W), mode="bilinear", align_corners=False)
+            else:
+                recon_subset = self.fhm(masked_subset)
+
+            # small residual scaling (keep recon close to masked input initially)
+            res_scale = float(self.fhm_res_scale.item())
+            recon_subset = masked_subset + res_scale * (recon_subset - masked_subset)
+
+            # build full reconstructed tensor (replace subset positions)
+            recon_all = roi_pooled.clone()
+            recon_all[inds] = recon_subset
+
+            # Pass both original and reconstructed pre-res5 features through res5
+            box_features_recon = self.res5(recon_all)
+
+            # Reconstruction loss computed only on the sampled indices (LayerNorm normalized)
+            target = F.layer_norm(roi_pooled[inds], roi_pooled[inds].shape[1:])
+            pred = F.layer_norm(recon_subset, recon_subset.shape[1:])
+            aux_losses["loss_rec"] = self.lambda_rec * F.mse_loss(pred, target, reduction="mean")
+
+            # AGP & sparsity on reconstructed Res5 outputs
+            pooled_rec, mask_rec, sparsity_rec = self.agp(box_features_recon)
+            aux_losses["loss_sp"] = self.lambda_sp * sparsity_rec
+
+            # choose pooled features for prediction according to config
+            if self.use_recon_for_pred:
+                pooled = pooled_rec
+            else:
+                pooled = pooled_orig
+
+        elif self.nsh_enabled and self.training and (not self.fhm_train):
+            # novel training: frozen FHM projection (no aux losses)
+            with torch.no_grad():
+                was_train = self.fhm.training
+                self.fhm.eval()
+                # reconstruct whole batch (no masking) as a projection
+                if self.fhm_spatial_red > 1:
+                    new_h = max(1, roi_pooled.shape[2] // self.fhm_spatial_red)
+                    new_w = max(1, roi_pooled.shape[3] // self.fhm_spatial_red)
+                    small = F.adaptive_avg_pool2d(roi_pooled, (new_h, new_w))
+                    recon_small = self.fhm(small)
+                    recon_all = F.interpolate(recon_small, size=(roi_pooled.shape[2], roi_pooled.shape[3]), mode="bilinear", align_corners=False)
+                else:
+                    recon_all = self.fhm(roi_pooled)
+                if was_train:
+                    self.fhm.train(was_train)
+            box_features_recon = self.res5(recon_all)
+            pooled, _, _ = self.agp(box_features_recon)
+
+        elif self.nsh_enabled and (not self.training):
+            # inference: full projection through FHM
+            if self.fhm_spatial_red > 1:
+                new_h = max(1, roi_pooled.shape[2] // self.fhm_spatial_red)
+                new_w = max(1, roi_pooled.shape[3] // self.fhm_spatial_red)
+                small = F.adaptive_avg_pool2d(roi_pooled, (new_h, new_w))
+                recon_small = self.fhm(small)
+                recon_all = F.interpolate(recon_small, size=(roi_pooled.shape[2], roi_pooled.shape[3]), mode="bilinear", align_corners=False)
+            else:
+                recon_all = self.fhm(roi_pooled)
+            box_features_recon = self.res5(recon_all)
+            pooled, _, _ = self.agp(box_features_recon)
+
+        # fallback pooling if none computed (shouldn't happen)
+        if pooled is None:
+            pooled = pooled_orig
+
+        # standard Fast R-CNN predictions
+        pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled)
+        outputs = FastRCNNOutputs(
+            self.box2box_transform,
+            pred_class_logits,
+            pred_proposal_deltas,
+            proposals,
+            self.smooth_l1_beta,
+        )
+
+        if self.training:
+            losses = outputs.losses()
+            losses.update(aux_losses)
+            return [], losses
+        else:
+            pred_instances, _ = outputs.inference(
+                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
+            )
+            return pred_instances, {}
