@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class SemanticVisualAlignment(nn.Module):
-    def __init__(self, in_dim: int, clip_dim: int = 512, hidden_dim: int = 1024, tau: float = 0.07):
+    def __init__(self, in_dim: int, clip_dim: int = 512, hidden: Optional[int] = None, hidden_dim: int = 1024, tau: float = 0.07):
         super().__init__()
         self.adapter = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),

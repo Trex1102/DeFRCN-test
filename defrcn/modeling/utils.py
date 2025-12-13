@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 @torch.no_grad()
 def concat_all_gathered(tensor):
