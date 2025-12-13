@@ -60,7 +60,10 @@ _CC.MODEL.NSH.FHM_HIDDEN = 256            # Hidden channels in FHM
 _CC.MODEL.NSH.CLIP_MODEL = "ViT-B/32"
 _CC.MODEL.NSH.CLIP_DIM = 512
 _CC.MODEL.NSH.CLIP_TAU = 0.07
-_CC.MODEL.NSH.CLASS_NAMES = []            # user should fill dataset class names
+_CC.MODEL.NSH.CLASS_NAMES = ["aeroplane", "bicycle", "boat", "bottle", "car",
+        "cat", "chair", "diningtable", "dog", "horse",
+        "person", "pottedplant", "sheep", "train", "tvmonitor",
+    ]            # user should fill dataset class names
 
 # ---- Loss Weights ---- #
 _CC.MODEL.NSH.LAMBDA_REC = 1.0
