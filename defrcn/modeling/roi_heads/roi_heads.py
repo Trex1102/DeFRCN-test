@@ -804,11 +804,8 @@ class Res5ROIHeadsNSHEfficient2(Res5ROIHeads):
 @ROI_HEADS_REGISTRY.register()
 class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
     """
-    Res5 ROI head with NSH (AGP + FHM) improvements:
-      - Reconstruct pre-Res5 pooled RoI features (pooler outputs).
-      - Compute reconstruction loss on masked subset only, normalized by LayerNorm.
-      - Stable residual scaling and smaller mask blocks.
-      - Config flag MODEL.NSH.USE_RECON_FOR_PRED (default False).
+    Res5 ROI head with NSH (AGP + FHM) improvements.
+    Defensive sanitization added to avoid Inf/NaN propagation.
     """
 
     def __init__(self, cfg, input_shape):
@@ -832,20 +829,32 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
         # whether to use reconstructed features for prediction (False = aux-only)
         self.use_recon_for_pred = bool(ns_cfg.get("USE_RECON_FOR_PRED", False))
 
-        # channels
+        # channels: out_ch is Res5 output channels (e.g. 2048)
         out_ch = getattr(self, "out_channels", None)
         if out_ch is None:
             out_ch = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS * (2 ** 3)
             self.out_channels = out_ch
 
+        # Determine pooler (pre-Res5) channel count safely from input_shape
+        try:
+            in_feat_name = self.in_features[0]
+            pooler_in_ch = input_shape[in_feat_name].channels
+        except Exception:
+            pooler_in_ch = out_ch // 2
+
         # modules
-        hidden = int(ns_cfg.get("FHM_HIDDEN", max(64, out_ch // 4)))
+        hidden = int(ns_cfg.get("FHM_HIDDEN", max(64, pooler_in_ch // 4)))
         self.agp = AttentiveGlobalPooling(out_ch)
-        # FHM expected to accept hidden_channels kwarg
-        self.fhm = FeatureHallucinationModule(out_ch, hidden_channels=hidden)
+        self.fhm = FeatureHallucinationModule(pooler_in_ch, hidden_channels=hidden)
 
         # a small residual scaling factor to stabilize optimization (start near masked input)
-        self.register_buffer("fhm_res_scale", torch.tensor(float(ns_cfg.get("FHM_RES_SCALE", 0.1)), dtype=torch.float32))
+        self.register_buffer(
+            "fhm_res_scale",
+            torch.tensor(float(ns_cfg.get("FHM_RES_SCALE", 0.01)), dtype=torch.float32),
+        )
+
+        # single-run flag for logging
+        self._nans_warned = False
 
     def forward(self, images, features, proposals, targets=None):
         del images
@@ -855,16 +864,29 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
 
         proposal_boxes = [x.proposal_boxes for x in proposals]
 
-        # --- IMPORTANT CHANGE: pooler outputs (pre-Res5) are the reconstruction targets ---
-        # roi_pooled: (R, C, H, W)
+        # --- use pooler outputs (pre-Res5) as reconstruction targets ---
         roi_pooled = self.pooler([features[f] for f in self.in_features], proposal_boxes)
 
-        # compute original Res5 outputs (without any masking) for safe baseline
+        # original res5 outputs baseline
         box_features_orig = self.res5(roi_pooled)
         pooled_orig, mask_orig, sparsity_orig = self.agp(box_features_orig)
 
         pooled = None
         aux_losses = {}
+        nan_detected = False  # per-forward flag
+
+        # --- helper sanitization function (available in all branches) ---
+        def _sanitize(tensor, name, clip_val=1e4):
+            nonlocal nan_detected
+            if not torch.isfinite(tensor).all():
+                if not self._nans_warned:
+                    logging.warning("NSH ROIHead: non-finite values detected in %s; sanitizing.", name)
+                    self._nans_warned = True
+                nan_detected = True
+                tensor = torch.nan_to_num(tensor, nan=0.0, posinf=clip_val, neginf=-clip_val)
+            # clamp to a reasonable range to avoid extreme activations
+            tensor = torch.clamp(tensor, min=-clip_val, max=clip_val)
+            return tensor
 
         if self.nsh_enabled and self.training and self.fhm_train:
             R, C, H, W = roi_pooled.shape
@@ -894,8 +916,12 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
             recon_all = roi_pooled.clone()
             recon_all[inds] = recon_subset
 
-            # Pass both original and reconstructed pre-res5 features through res5
+            # sanitize recon_all before res5
+            recon_all = _sanitize(recon_all, "recon_all_pre_res5")
+
+            # Pass reconstructed pre-Res5 features through res5
             box_features_recon = self.res5(recon_all)
+            box_features_recon = _sanitize(box_features_recon, "box_features_recon")
 
             # Reconstruction loss computed only on the sampled indices (LayerNorm normalized)
             target = F.layer_norm(roi_pooled[inds], roi_pooled[inds].shape[1:])
@@ -907,17 +933,13 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
             aux_losses["loss_sp"] = self.lambda_sp * sparsity_rec
 
             # choose pooled features for prediction according to config
-            if self.use_recon_for_pred:
-                pooled = pooled_rec
-            else:
-                pooled = pooled_orig
+            pooled = pooled_rec if self.use_recon_for_pred else pooled_orig
 
         elif self.nsh_enabled and self.training and (not self.fhm_train):
             # novel training: frozen FHM projection (no aux losses)
             with torch.no_grad():
                 was_train = self.fhm.training
                 self.fhm.eval()
-                # reconstruct whole batch (no masking) as a projection
                 if self.fhm_spatial_red > 1:
                     new_h = max(1, roi_pooled.shape[2] // self.fhm_spatial_red)
                     new_w = max(1, roi_pooled.shape[3] // self.fhm_spatial_red)
@@ -928,7 +950,9 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
                     recon_all = self.fhm(roi_pooled)
                 if was_train:
                     self.fhm.train(was_train)
+            recon_all = _sanitize(recon_all, "recon_all_novel")
             box_features_recon = self.res5(recon_all)
+            box_features_recon = _sanitize(box_features_recon, "box_features_recon_novel")
             pooled, _, _ = self.agp(box_features_recon)
 
         elif self.nsh_enabled and (not self.training):
@@ -941,15 +965,57 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
                 recon_all = F.interpolate(recon_small, size=(roi_pooled.shape[2], roi_pooled.shape[3]), mode="bilinear", align_corners=False)
             else:
                 recon_all = self.fhm(roi_pooled)
+            recon_all = _sanitize(recon_all, "recon_all_infer")
             box_features_recon = self.res5(recon_all)
+            box_features_recon = _sanitize(box_features_recon, "box_features_recon_infer")
             pooled, _, _ = self.agp(box_features_recon)
 
-        # fallback pooling if none computed (shouldn't happen)
+        # fallback pooling if none computed
         if pooled is None:
             pooled = pooled_orig
 
-        # standard Fast R-CNN predictions
-        pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled)
+        # sanitize pooled before predictor (and normalize to stabilize scale)
+        pooled = _sanitize(pooled, "pooled_before_predictor")
+        try:
+            # apply LayerNorm to pooled features to reduce chance of extreme logits/deltas
+            pooled_normed = F.layer_norm(pooled, pooled.shape[1:])
+        except Exception:
+            pooled_normed = pooled
+
+        # Also sanitize proposals' proposal_boxes (replace non-finite values)
+        for p in proposals:
+            boxes_tensor = p.proposal_boxes.tensor
+            if not torch.isfinite(boxes_tensor).all():
+                if not self._nans_warned:
+                    logging.warning("NSH ROIHead: non-finite values in proposal boxes; sanitizing.")
+                    self._nans_warned = True
+                nan_detected = True
+                p.proposal_boxes.tensor = torch.nan_to_num(boxes_tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+                p.proposal_boxes.tensor = torch.clamp(p.proposal_boxes.tensor, min=-1e4, max=1e4)
+
+        # standard Fast R-CNN predictions (wrapped to catch/policize NaNs)
+        try:
+            pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled_normed)
+        except Exception as e:
+            # If the predictor itself crashes, sanitize inputs and retry once
+            if not self._nans_warned:
+                logging.warning("NSH ROIHead: box_predictor raised %s; sanitizing inputs and retrying.", e)
+                self._nans_warned = True
+            pooled_normed = _sanitize(pooled_normed, "pooled_normed_retry")
+            pooled_normed = torch.clamp(pooled_normed, min=-1e4, max=1e4)
+            pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled_normed)
+
+        # sanitize predictions
+        if not torch.isfinite(pred_class_logits).all() or not torch.isfinite(pred_proposal_deltas).all():
+            if not self._nans_warned:
+                logging.warning("NSH ROIHead: non-finite values in predictions; sanitizing.")
+                self._nans_warned = True
+            nan_detected = True
+            pred_class_logits = torch.nan_to_num(pred_class_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred_proposal_deltas = torch.nan_to_num(pred_proposal_deltas, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred_class_logits = torch.clamp(pred_class_logits, min=-1e4, max=1e4)
+            pred_proposal_deltas = torch.clamp(pred_proposal_deltas, min=-1e4, max=1e4)
+
         outputs = FastRCNNOutputs(
             self.box2box_transform,
             pred_class_logits,
@@ -960,6 +1026,10 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
 
         if self.training:
             losses = outputs.losses()
+            # attach diagnostic flag if sanitization occurred
+            if nan_detected:
+                # small diagnostic scalar, kept on same device as pred_class_logits
+                losses["loss_nan_detected"] = torch.tensor(1.0, device=pred_class_logits.device)
             losses.update(aux_losses)
             return [], losses
         else:
