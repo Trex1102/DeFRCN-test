@@ -1037,3 +1037,295 @@ class Res5ROIHeadsNSHEfficient3(Res5ROIHeads):
                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
             )
             return pred_instances, {}
+
+
+
+@ROI_HEADS_REGISTRY.register()
+class Res5ROIHeadsNSHEfficient4(Res5ROIHeads):
+    """
+    Res5 ROI head with NSH (AGP + FHM) improvements + SVA integration.
+    Defensive sanitization kept from previous version.
+    """
+
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+
+        ns_cfg = getattr(cfg.MODEL, "NSH", {}) or {}
+        self.nsh_enabled = bool(ns_cfg.get("ENABLED", True))
+        if not self.nsh_enabled:
+            return
+
+        # Efficiency knobs / hyperparams
+        self.fhm_sample_ratio = float(ns_cfg.get("FHM_SAMPLE_RATIO", 0.25))
+        self.fhm_max_samples = int(ns_cfg.get("FHM_MAX_SAMPLES", 128))
+        self.fhm_spatial_red = int(ns_cfg.get("FHM_SPATIAL_RED", 1))
+        self.fhm_train = bool(ns_cfg.get("FHM_TRAIN", True))
+
+        # loss weights
+        self.lambda_rec = float(ns_cfg.get("LAMBDA_REC", 1.0))
+        self.lambda_sva = float(ns_cfg.get("LAMBDA_SVA", 0.1))
+        self.lambda_sp = float(ns_cfg.get("LAMBDA_SP", 0.01))
+
+        # whether to use reconstructed features for prediction (False = aux-only)
+        self.use_recon_for_pred = bool(ns_cfg.get("USE_RECON_FOR_PRED", False))
+
+        # channels: out_ch is Res5 output channels (e.g. 2048)
+        out_ch = getattr(self, "out_channels", None)
+        if out_ch is None:
+            out_ch = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS * (2 ** 3)
+            self.out_channels = out_ch
+
+        # Determine pooler (pre-Res5) channel count safely from input_shape
+        try:
+            in_feat_name = self.in_features[0]
+            pooler_in_ch = input_shape[in_feat_name].channels
+        except Exception:
+            pooler_in_ch = out_ch // 2
+
+        # modules
+        hidden = int(ns_cfg.get("FHM_HIDDEN", max(64, pooler_in_ch // 4)))
+        self.agp = AttentiveGlobalPooling(out_ch)
+        self.fhm = FeatureHallucinationModule(pooler_in_ch, hidden_channels=hidden)
+
+        # SVA module (adapter operates on Res5 pooled dim = out_ch)
+        clip_dim = int(ns_cfg.get("CLIP_DIM", 512))
+        # use keyword hidden_dim for clarity/backwards-compat
+        self.sva = SemanticVisualAlignment(in_dim=out_ch, clip_dim=clip_dim, hidden_dim=int(ns_cfg.get("SVA_HIDDEN", 1024)), tau=float(ns_cfg.get("CLIP_TAU", 0.07)))
+
+        # lazy text embeddings auto-load (optional)
+        class_names = ns_cfg.get("CLASS_NAMES", None)
+        if class_names:
+            try:
+                import clip
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                clip_model_name = ns_cfg.get("CLIP_MODEL", "ViT-B/32")
+                clip_model, _ = clip.load(clip_model_name, device=device, jit=False)
+                clip_model.eval()
+                with torch.no_grad():
+                    prompts = [f"a photo of a {c}" for c in class_names]
+                    tokens = clip.tokenize(prompts).to(device)
+                    t_emb = clip_model.encode_text(tokens).float()
+                    t_emb = F.normalize(t_emb, dim=1)
+                    # store CPU to avoid reserving GPU memory; moved lazily when needed
+                    self.sva.text_embeddings = t_emb.cpu()
+            except Exception as e:
+                logging.warning("Automatic CLIP load for SVA failed; set SVA text_embeddings manually. %s", e)
+
+        # a small residual scaling factor to stabilize optimization (start near masked input)
+        self.register_buffer(
+            "fhm_res_scale",
+            torch.tensor(float(ns_cfg.get("FHM_RES_SCALE", 0.01)), dtype=torch.float32),
+        )
+
+        # single-run flag for logging
+        self._nans_warned = False
+        self._text_emb_on_device = False  # track lazy move of text embeddings
+
+    def _ensure_text_emb_on_device(self, device):
+        """
+        Move text embeddings to `device` once (lazy). Keep as buffer on module.
+        """
+        te = getattr(self.sva, "text_embeddings", None)
+        if te is None:
+            return
+        if not self._text_emb_on_device or te.device != device:
+            # move (and keep flag)
+            self.sva.text_embeddings = te.to(device)
+            self._text_emb_on_device = True
+
+    def forward(self, images, features, proposals, targets=None):
+        del images
+        if self.training:
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        del targets
+
+        proposal_boxes = [x.proposal_boxes for x in proposals]
+
+        # --- use pooler outputs (pre-Res5) as reconstruction targets ---
+        roi_pooled = self.pooler([features[f] for f in self.in_features], proposal_boxes)
+
+        # original res5 outputs baseline
+        box_features_orig = self.res5(roi_pooled)
+        pooled_orig, mask_orig, sparsity_orig = self.agp(box_features_orig)
+
+        pooled = None
+        aux_losses = {}
+        nan_detected = False  # per-forward flag
+
+        # sanitizer helper
+        def _sanitize(tensor, name, clip_val=1e4):
+            nonlocal nan_detected
+            if not torch.isfinite(tensor).all():
+                if not self._nans_warned:
+                    logging.warning("NSH ROIHead: non-finite values detected in %s; sanitizing.", name)
+                    self._nans_warned = True
+                nan_detected = True
+                tensor = torch.nan_to_num(tensor, nan=0.0, posinf=clip_val, neginf=-clip_val)
+            tensor = torch.clamp(tensor, min=-clip_val, max=clip_val)
+            return tensor
+
+        if self.nsh_enabled and self.training and self.fhm_train:
+            R, C, H, W = roi_pooled.shape
+            device = roi_pooled.device
+
+            # sample subset indices for hallucination
+            inds = sample_indices(R, self.fhm_sample_ratio, max_samples=self.fhm_max_samples, device=device)
+
+            # masked subset only (avoid identity learning)
+            masked_subset, _ = apply_random_block_mask(roi_pooled[inds], block_h=2, block_w=2)
+
+            # optional spatial reduction before FHM for efficiency
+            if self.fhm_spatial_red > 1:
+                new_h = max(1, H // self.fhm_spatial_red)
+                new_w = max(1, W // self.fhm_spatial_red)
+                small_masked = F.adaptive_avg_pool2d(masked_subset, (new_h, new_w))
+                recon_small = self.fhm(small_masked)
+                recon_subset = F.interpolate(recon_small, size=(H, W), mode="bilinear", align_corners=False)
+            else:
+                recon_subset = self.fhm(masked_subset)
+
+            # small residual scaling (keep recon close to masked input initially)
+            res_scale = float(self.fhm_res_scale.item())
+            recon_subset = masked_subset + res_scale * (recon_subset - masked_subset)
+
+            # build full reconstructed tensor (replace subset positions)
+            recon_all = roi_pooled.clone()
+            recon_all[inds] = recon_subset
+            recon_all = _sanitize(recon_all, "recon_all_pre_res5")
+
+            # Pass reconstructed pre-Res5 features through res5
+            box_features_recon = self.res5(recon_all)
+            box_features_recon = _sanitize(box_features_recon, "box_features_recon")
+
+            # Reconstruction loss computed only on the sampled indices (LayerNorm normalized)
+            target = F.layer_norm(roi_pooled[inds], roi_pooled[inds].shape[1:])
+            pred = F.layer_norm(recon_subset, recon_subset.shape[1:])
+            aux_losses["loss_rec"] = self.lambda_rec * F.mse_loss(pred, target, reduction="mean")
+
+            # AGP & sparsity on reconstructed Res5 outputs
+            pooled_rec, mask_rec, sparsity_rec = self.agp(box_features_recon)
+            aux_losses["loss_sp"] = self.lambda_sp * sparsity_rec
+
+            # choose pooled features for prediction according to config
+            pooled = pooled_rec if self.use_recon_for_pred else pooled_orig
+
+            # ------------------ SVA (contrastive) ------------------
+            # compute only if text embeddings are provided
+            if proposals and proposals[0].has("gt_classes") and getattr(self.sva, "text_embeddings", None) is not None:
+                # prepare gt class ids and foreground mask
+                gt_classes = torch.cat([p.gt_classes for p in proposals], dim=0).to(device)
+                fg_inds = torch.nonzero((gt_classes >= 0) & (gt_classes < self.num_classes)).squeeze(1)
+                if fg_inds.numel() > 0:
+                    # ensure text embeddings on same device
+                    self._ensure_text_emb_on_device(device)
+                    # defensive: ensure dtype float32 and normalized
+                    te = self.sva.text_embeddings
+                    if te is not None:
+                        if te.dtype != torch.float32:
+                            te = te.float()
+                        te = F.normalize(te, dim=1)
+                        self.sva.text_embeddings = te
+                        # compute visual embeddings from pooled (use pooled, not pooled_rec necessarily)
+                        vis_feats = self.sva(pooled[fg_inds])
+                        loss_sva = self.sva.contrastive_loss(vis_feats, gt_classes[fg_inds].long())
+                        aux_losses["loss_sva"] = self.lambda_sva * loss_sva
+
+        elif self.nsh_enabled and self.training and (not self.fhm_train):
+            # novel training: frozen FHM projection (no aux losses)
+            with torch.no_grad():
+                was_train = self.fhm.training
+                self.fhm.eval()
+                if self.fhm_spatial_red > 1:
+                    new_h = max(1, roi_pooled.shape[2] // self.fhm_spatial_red)
+                    new_w = max(1, roi_pooled.shape[3] // self.fhm_spatial_red)
+                    small = F.adaptive_avg_pool2d(roi_pooled, (new_h, new_w))
+                    recon_small = self.fhm(small)
+                    recon_all = F.interpolate(recon_small, size=(roi_pooled.shape[2], roi_pooled.shape[3]), mode="bilinear", align_corners=False)
+                else:
+                    recon_all = self.fhm(roi_pooled)
+                if was_train:
+                    self.fhm.train(was_train)
+            recon_all = _sanitize(recon_all, "recon_all_novel")
+            box_features_recon = self.res5(recon_all)
+            box_features_recon = _sanitize(box_features_recon, "box_features_recon_novel")
+            pooled, _, _ = self.agp(box_features_recon)
+
+        elif self.nsh_enabled and (not self.training):
+            # inference: full projection through FHM
+            if self.fhm_spatial_red > 1:
+                new_h = max(1, roi_pooled.shape[2] // self.fhm_spatial_red)
+                new_w = max(1, roi_pooled.shape[3] // self.fhm_spatial_red)
+                small = F.adaptive_avg_pool2d(roi_pooled, (new_h, new_w))
+                recon_small = self.fhm(small)
+                recon_all = F.interpolate(recon_small, size=(roi_pooled.shape[2], roi_pooled.shape[3]), mode="bilinear", align_corners=False)
+            else:
+                recon_all = self.fhm(roi_pooled)
+            recon_all = _sanitize(recon_all, "recon_all_infer")
+            box_features_recon = self.res5(recon_all)
+            box_features_recon = _sanitize(box_features_recon, "box_features_recon_infer")
+            pooled, _, _ = self.agp(box_features_recon)
+
+        # fallback pooling if none computed
+        if pooled is None:
+            pooled = pooled_orig
+
+        # sanitize pooled before predictor (and normalize to stabilize scale)
+        pooled = _sanitize(pooled, "pooled_before_predictor")
+        try:
+            pooled_normed = F.layer_norm(pooled, pooled.shape[1:])
+        except Exception:
+            pooled_normed = pooled
+
+        # Also sanitize proposals' proposal_boxes (replace non-finite values)
+        for p in proposals:
+            boxes_tensor = p.proposal_boxes.tensor
+            if not torch.isfinite(boxes_tensor).all():
+                if not self._nans_warned:
+                    logging.warning("NSH ROIHead: non-finite values in proposal boxes; sanitizing.")
+                    self._nans_warned = True
+                nan_detected = True
+                p.proposal_boxes.tensor = torch.nan_to_num(boxes_tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+                p.proposal_boxes.tensor = torch.clamp(p.proposal_boxes.tensor, min=-1e4, max=1e4)
+
+        # standard Fast R-CNN predictions (wrapped to catch/policize NaNs)
+        try:
+            pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled_normed)
+        except Exception as e:
+            if not self._nans_warned:
+                logging.warning("NSH ROIHead: box_predictor raised %s; sanitizing inputs and retrying.", e)
+                self._nans_warned = True
+            pooled_normed = _sanitize(pooled_normed, "pooled_normed_retry")
+            pooled_normed = torch.clamp(pooled_normed, min=-1e4, max=1e4)
+            pred_class_logits, pred_proposal_deltas = self.box_predictor(pooled_normed)
+
+        # sanitize predictions
+        if not torch.isfinite(pred_class_logits).all() or not torch.isfinite(pred_proposal_deltas).all():
+            if not self._nans_warned:
+                logging.warning("NSH ROIHead: non-finite values in predictions; sanitizing.")
+                self._nans_warned = True
+            nan_detected = True
+            pred_class_logits = torch.nan_to_num(pred_class_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred_proposal_deltas = torch.nan_to_num(pred_proposal_deltas, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred_class_logits = torch.clamp(pred_class_logits, min=-1e4, max=1e4)
+            pred_proposal_deltas = torch.clamp(pred_proposal_deltas, min=-1e4, max=1e4)
+
+        outputs = FastRCNNOutputs(
+            self.box2box_transform,
+            pred_class_logits,
+            pred_proposal_deltas,
+            proposals,
+            self.smooth_l1_beta,
+        )
+
+        if self.training:
+            losses = outputs.losses()
+            # attach diagnostic flag if sanitization occurred
+            if nan_detected:
+                losses["loss_nan_detected"] = torch.tensor(1.0, device=pred_class_logits.device)
+            losses.update(aux_losses)
+            return [], losses
+        else:
+            pred_instances, _ = outputs.inference(
+                self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
+            )
+            return pred_instances, {}
