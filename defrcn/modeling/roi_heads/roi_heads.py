@@ -1329,3 +1329,10 @@ class Res5ROIHeadsNSHEfficient4(Res5ROIHeads):
                 self.test_score_thresh, self.test_nms_thresh, self.test_detections_per_img
             )
             return pred_instances, {}
+
+        if self.training and self.nsh_enabled and self.sva.text_embeddings is not None:
+            # debug
+            if self.sva.text_embeddings.shape[0] != self.num_classes:
+                logging.warning("SVA text_embeddings num_classes mismatch: %d vs roi_heads.num_classes=%d",
+                            self.sva.text_embeddings.shape[0], self.num_classes)
+
