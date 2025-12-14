@@ -66,7 +66,7 @@ _CC.MODEL.NSH.CLASS_NAMES = ["aeroplane", "bicycle", "boat", "bottle", "car",
     ]            # user should fill dataset class names
 
 # ---- Loss Weights ---- #
-_CC.MODEL.NSH.LAMBDA_REC = 1.0
+_CC.MODEL.NSH.LAMBDA_REC = 0.0
 _CC.MODEL.NSH.LAMBDA_SVA = 0.1
 _CC.MODEL.NSH.LAMBDA_SP  = 0.01
 
